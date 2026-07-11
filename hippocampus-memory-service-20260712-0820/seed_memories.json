@@ -1,0 +1,106 @@
+{
+  "episodic_memories": [
+    {
+      "id": "episode_demo_evening_planning",
+      "date": "2026-01-15",
+      "title": "Evening planning became a reusable memory",
+      "summary": "The user and assistant discussed a fictional evening planning session involving dinner timing, ingredient constraints, and a warm conversational tone. The exchange may be useful as a demo of how an ordinary episode can later become retrievable context without storing the full transcript.",
+      "keywords": [
+        "demo",
+        "evening planning",
+        "dinner",
+        "episodic memory",
+        "retrieval"
+      ],
+      "entities": [
+        "user",
+        "assistant"
+      ],
+      "emotion": {
+        "valence": "positive",
+        "intensity": 0.72,
+        "tags": [
+          "warm",
+          "practical",
+          "collaborative"
+        ]
+      },
+      "importance_score": 0.74,
+      "recency_score": 0.35,
+      "repetition_score": 0.2,
+      "continuity_score": 0.55,
+      "pinned": false,
+      "source": {
+        "conversation_id": "demo-conversation",
+        "note": "Fictional seed data for public examples"
+      },
+      "retention": {
+        "decay": "normal",
+        "archive": true
+      },
+      "confidence": 0.7,
+      "evidence_type": "inferred",
+      "wording_policy": "tentative",
+      "user_confirmed": false
+    }
+  ],
+  "project_memories": [
+    {
+      "id": "project_demo_local_ai_memory",
+      "title": "Local AI memory experiment",
+      "status": "active",
+      "summary": "A local AI stack is experimenting with an external memory service that retrieves compact memories before a chat model responds. The project keeps inferred memories tentative and separates explicit user instructions from episodic and project memories.",
+      "current_state": [
+        "The memory service exposes FastAPI endpoints.",
+        "SQLite FTS5 is used for keyword-oriented retrieval.",
+        "A chat frontend can call /context/build before sending a model request."
+      ],
+      "open_questions": [
+        "How should frontends expose memory review and deletion?",
+        "When should semantic embeddings be added as an optional layer?",
+        "How should nightly consolidation jobs be scheduled?"
+      ],
+      "related_episodes": [
+        "episode_demo_evening_planning"
+      ],
+      "keywords": [
+        "local AI",
+        "memory service",
+        "FastAPI",
+        "SQLite FTS5",
+        "OpenWebUI",
+        "hook"
+      ],
+      "importance_score": 0.86,
+      "pinned": true,
+      "confidence": 0.9,
+      "evidence_type": "explicit",
+      "wording_policy": "confirmed",
+      "user_confirmed": true
+    }
+  ],
+  "persistent_memories": [
+    {
+      "id": "persistent_demo_retrieval_preference",
+      "title": "Prefer keyword-first retrieval for technical support",
+      "content": "For technical support conversations, prefer keyword-searchable memories and compact evidence over opaque summaries.",
+      "category": "retrieval_preference",
+      "keywords": [
+        "technical support",
+        "keyword search",
+        "retrieval",
+        "evidence"
+      ],
+      "importance_score": 0.92,
+      "pinned": true,
+      "source": {
+        "conversation_id": "demo-conversation",
+        "note": "Fictional explicit memory for public examples"
+      },
+      "confidence": 1.0,
+      "evidence_type": "explicit",
+      "wording_policy": "confirmed",
+      "user_confirmed": true
+    }
+  ]
+}
