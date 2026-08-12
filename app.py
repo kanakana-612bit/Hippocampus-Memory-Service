@@ -15,8 +15,8 @@ class UTF8JSONResponse(JSONResponse):
 
 app = FastAPI(
     title="Hippocampus Memory Service",
-    version="0.1.0",
-    description="Prototype episodic memory compression and retrieval service for local chat frontends.",
+    version="0.2.0",
+    description="Layered short-term and long-term memory service for local chat frontends.",
     default_response_class=UTF8JSONResponse,
 )
 
@@ -40,7 +40,9 @@ class RetrieveRequest(BaseModel):
     query: str
     limit: int = Field(default=8, ge=1, le=50)
     include_archived: bool = False
-    memory_types: list[Literal["episodic", "project", "persistent"]] | None = None
+    memory_types: list[
+        Literal["episodic", "semantic", "prospective", "procedural", "embodied", "project", "persistent"]
+    ] | None = None
     update_recall: bool = True
 
 
@@ -121,9 +123,113 @@ class LearnOpenWebUIChatRequest(BaseModel):
     max_chars: int = Field(default=24000, ge=4000, le=80000)
 
 
-@app.on_event("startup")
-def startup() -> None:
-    manager.init_db()
+class MemoryTraceCreate(BaseModel):
+    conversation_id: str | None = None
+    turn_id: str | None = None
+    trace_stage: Literal["proto", "candidate"] = "proto"
+    candidate_memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
+    title: str | None = None
+    content: str
+    keywords: list[str] = Field(default_factory=list)
+    acquisition_mode: Literal["automatic", "user_explicit", "reviewed", "system_derived"] = "automatic"
+    epistemic_status: Literal["observed", "inferred", "confirmed", "disputed"] = "inferred"
+    epistemic_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    activation: float = Field(default=0.5, ge=0.0, le=1.0)
+    salience: float = Field(default=0.5, ge=0.0, le=1.0)
+    stability: float = Field(default=0.1, ge=0.0, le=1.0)
+    continuity_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    affect_signal: dict[str, Any] = Field(default_factory=dict)
+    evidence_summary: str = ""
+    source_event_ids: list[str] = Field(default_factory=list)
+    source: dict[str, Any] = Field(default_factory=dict)
+    observation_statement: str | None = None
+    perspective: str | None = None
+    evidence_kind: Literal["direct_measurement", "self_report", "model_output", "derived"] | None = None
+    observation_fidelity: float | None = Field(default=None, ge=0.0, le=1.0)
+    source_reliability: float | None = Field(default=None, ge=0.0, le=1.0)
+    world_hypothesis: str | None = None
+    record_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    review_threshold: float = Field(default=0.82, ge=0.0, le=1.0)
+    delete_threshold: float = Field(default=0.15, ge=0.0, le=1.0)
+    expires_at: str | None = None
+
+
+class MemoryTracePatch(BaseModel):
+    trace_stage: Literal["proto", "candidate"] | None = None
+    candidate_memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
+    title: str | None = None
+    content: str | None = None
+    keywords: list[str] | None = None
+    acquisition_mode: Literal["automatic", "user_explicit", "reviewed", "system_derived"] | None = None
+    epistemic_status: Literal["observed", "inferred", "confirmed", "disputed"] | None = None
+    epistemic_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    activation: float | None = Field(default=None, ge=0.0, le=1.0)
+    salience: float | None = Field(default=None, ge=0.0, le=1.0)
+    stability: float | None = Field(default=None, ge=0.0, le=1.0)
+    continuity_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    affect_signal: dict[str, Any] | None = None
+    evidence_summary: str | None = None
+    source_event_ids: list[str] | None = None
+    source: dict[str, Any] | None = None
+    observation_statement: str | None = None
+    perspective: str | None = None
+    evidence_kind: Literal["direct_measurement", "self_report", "model_output", "derived"] | None = None
+    observation_fidelity: float | None = Field(default=None, ge=0.0, le=1.0)
+    source_reliability: float | None = Field(default=None, ge=0.0, le=1.0)
+    world_hypothesis: str | None = None
+    record_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    review_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    delete_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    status: Literal["active", "review", "consolidated", "archived"] | None = None
+    expires_at: str | None = None
+
+
+class TraceConsolidateRequest(BaseModel):
+    memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
+    title: str | None = None
+    confirmed: bool = False
+
+
+class TraceReviewRequest(BaseModel):
+    decision: Literal["confirm", "keep", "archive"]
+    memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
+    title: str | None = None
+    notes: str | None = None
+
+
+class MemoryMaintenanceRequest(BaseModel):
+    as_of: str | None = None
+    daily_decay_rate: float = Field(default=0.90, ge=0.01, le=0.999)
+    auto_consolidate: bool = False
+    archive_below_threshold: bool = True
+
+
+class LongTermMemoryPatch(BaseModel):
+    memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
+    title: str | None = None
+    content: str | None = None
+    keywords: list[str] | None = None
+    entities: list[str] | None = None
+    acquisition_mode: Literal["automatic", "user_explicit", "reviewed", "system_derived"] | None = None
+    epistemic_status: Literal["observed", "inferred", "confirmed", "disputed"] | None = None
+    epistemic_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    activation: float | None = Field(default=None, ge=0.0, le=1.0)
+    salience: float | None = Field(default=None, ge=0.0, le=1.0)
+    stability: float | None = Field(default=None, ge=0.0, le=1.0)
+    continuity_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    pinned: bool | None = None
+    archived: bool | None = None
+    evidence_summary: str | None = None
+    source_event_ids: list[str] | None = None
+    source: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    observation_statement: str | None = None
+    perspective: str | None = None
+    evidence_kind: Literal["direct_measurement", "self_report", "model_output", "derived"] | None = None
+    observation_fidelity: float | None = Field(default=None, ge=0.0, le=1.0)
+    source_reliability: float | None = Field(default=None, ge=0.0, le=1.0)
+    world_hypothesis: str | None = None
+    expires_at: str | None = None
 
 
 @app.get("/health")
@@ -234,6 +340,168 @@ def build_context(req: ContextRequest) -> dict[str, Any]:
         conversation_id=req.conversation_id,
         char_budget=req.char_budget,
     )
+
+
+@app.post("/memory/traces")
+def create_memory_trace(req: MemoryTraceCreate) -> dict[str, Any]:
+    try:
+        return manager.create_memory_trace(req.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/memory/traces")
+def list_memory_traces(
+    status: Literal["active", "review", "consolidated", "archived"] | None = None,
+    conversation_id: str | None = None,
+    include_archived: bool = False,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    return {
+        "traces": manager.list_memory_traces(
+            status=status,
+            conversation_id=conversation_id,
+            include_archived=include_archived,
+            limit=limit,
+        )
+    }
+
+
+@app.get("/memory/traces/{trace_id}")
+def get_memory_trace(trace_id: str) -> dict[str, Any]:
+    try:
+        return manager.get_memory_trace(trace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/memory/traces/{trace_id}")
+def patch_memory_trace(trace_id: str, patch: MemoryTracePatch) -> dict[str, Any]:
+    try:
+        return manager.patch_memory_trace(trace_id, patch.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memory/traces/{trace_id}/recall")
+def recall_memory_trace(trace_id: str) -> dict[str, Any]:
+    try:
+        return manager.recall_memory_trace(trace_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/memory/traces/{trace_id}/review")
+def review_memory_trace(trace_id: str, req: TraceReviewRequest) -> dict[str, Any]:
+    try:
+        return manager.review_memory_trace(
+            trace_id,
+            decision=req.decision,
+            memory_type=req.memory_type,
+            title=req.title,
+            notes=req.notes,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memory/traces/{trace_id}/consolidate")
+def consolidate_memory_trace(trace_id: str, req: TraceConsolidateRequest) -> dict[str, Any]:
+    try:
+        return manager.consolidate_memory_trace(
+            trace_id,
+            memory_type=req.memory_type,
+            title=req.title,
+            confirmed=req.confirmed,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memory/maintenance")
+def maintain_memory_layers(req: MemoryMaintenanceRequest) -> dict[str, Any]:
+    try:
+        return manager.maintain_memory_layers(
+            as_of=req.as_of,
+            daily_decay_rate=req.daily_decay_rate,
+            auto_consolidate=req.auto_consolidate,
+            archive_below_threshold=req.archive_below_threshold,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memories/retrieve")
+def retrieve_long_term_memories(req: RetrieveRequest) -> dict[str, Any]:
+    try:
+        results = manager.retrieve(
+            req.query,
+            limit=req.limit,
+            include_archived=req.include_archived,
+            memory_types=req.memory_types,
+            update_recall=req.update_recall,
+        )
+        return {"retrieved": [manager.result_to_dict(result) for result in results]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/memories")
+def list_long_term_memories(
+    memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None,
+    epistemic_status: Literal["observed", "inferred", "confirmed", "disputed"] | None = None,
+    include_archived: bool = False,
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    return {
+        "memories": manager.list_long_term_memories(
+            memory_type=memory_type,
+            epistemic_status=epistemic_status,
+            include_archived=include_archived,
+            limit=limit,
+        )
+    }
+
+
+@app.get("/memories/{memory_id}")
+def get_long_term_memory(memory_id: str) -> dict[str, Any]:
+    try:
+        return manager.get_long_term_memory(memory_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/memories/{memory_id}/evidence")
+def get_long_term_memory_evidence(memory_id: str) -> dict[str, Any]:
+    try:
+        return manager.get_long_term_memory_evidence(memory_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/memories/{memory_id}")
+def patch_long_term_memory(memory_id: str, patch: LongTermMemoryPatch) -> dict[str, Any]:
+    try:
+        return manager.patch_long_term_memory(memory_id, patch.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/memories/{memory_id}")
+def forget_long_term_memory(memory_id: str) -> dict[str, Any]:
+    try:
+        manager.forget_long_term_memory(memory_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"forgotten": {"memory_id": memory_id}}
 
 
 @app.get("/memory")

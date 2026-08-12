@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from layered_memory import ClosingConnection, LayeredMemoryStore
+
 try:
     import yaml
 except Exception:  # pragma: no cover - YAML is optional.
@@ -178,10 +180,11 @@ class MemoryManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.lmstudio_base_url = os.getenv("LMSTUDIO_BASE_URL", DEFAULT_LMSTUDIO_BASE_URL)
         self.llm_model = os.getenv("HIPPOCAMPUS_LLM_MODEL", DEFAULT_LLM_MODEL)
+        self.layered = LayeredMemoryStore(self.db_path)
         self.init_db()
 
     def connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, factory=ClosingConnection)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys = ON")
         return con
@@ -189,6 +192,7 @@ class MemoryManager:
     def init_db(self) -> None:
         with self.connect() as con:
             con.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+            self.layered.initialize(con)
 
     def seed(self, seed_path: str | Path | None = None, overwrite: bool = False) -> dict[str, int]:
         path = Path(seed_path or ROOT / "seed_memories.json")
@@ -223,6 +227,8 @@ class MemoryManager:
             "episodic_memories": self.list_memories("episodic", include_archived=True),
             "project_memories": self.list_memories("project", include_archived=True),
             "persistent_memories": self.list_memories("persistent", include_archived=True),
+            "memory_traces": self.layered.list_traces(include_archived=True, limit=1000),
+            "memories": self.layered.list_memories(include_archived=True, limit=1000),
         }
         if path:
             out = Path(path)
@@ -305,6 +311,9 @@ class MemoryManager:
                 ),
             )
             self.index_memory(con, "episodic", memory_id)
+            legacy_memory = self.get_memory_with_connection(con, "episodic", memory_id)
+            if legacy_memory:
+                self.layered.sync_legacy_memory("episodic", legacy_memory, con=con)
             if own:
                 con.commit()
             return True
@@ -369,6 +378,9 @@ class MemoryManager:
                 ),
             )
             self.index_memory(con, "project", memory_id)
+            legacy_memory = self.get_memory_with_connection(con, "project", memory_id)
+            if legacy_memory:
+                self.layered.sync_legacy_memory("project", legacy_memory, con=con)
             if own:
                 con.commit()
             return True
@@ -426,6 +438,9 @@ class MemoryManager:
                 ),
             )
             self.index_memory(con, "persistent", memory_id)
+            legacy_memory = self.get_memory_with_connection(con, "persistent", memory_id)
+            if legacy_memory:
+                self.layered.sync_legacy_memory("persistent", legacy_memory, con=con)
             if own:
                 con.commit()
             return True
@@ -477,6 +492,9 @@ class MemoryManager:
                     ),
                 )
                 self.index_memory(con, "persistent", duplicate["id"])
+                legacy_memory = self.get_memory_with_connection(con, "persistent", duplicate["id"])
+                if legacy_memory:
+                    self.layered.sync_legacy_memory("persistent", legacy_memory, con=con)
             return {
                 "action": "updated",
                 "memory": self.get_memory("persistent", duplicate["id"]),
@@ -1134,49 +1152,24 @@ class MemoryManager:
         memory_types: list[str] | None = None,
         update_recall: bool = True,
     ) -> list[RetrievalResult]:
-        types = memory_types or list(MEMORY_TABLES)
-        terms = query_terms(query)
-        recall_trigger = has_recall_trigger(query)
-        results: list[RetrievalResult] = []
-        with self.connect() as con:
-            fts_hits = self.fts_hits(con, terms)
-            for memory_type in types:
-                for memory in self.list_memories(memory_type, include_archived=include_archived, con=con):
-                    components = self.score_components(query, terms, memory, memory_type, fts_hits)
-                    if components["keyword_score"] <= 0.0 and not (
-                        recall_trigger
-                        and memory_type == "episodic"
-                        and memory.get("pinned")
-                        and components["importance_score"] >= 0.8
-                    ):
-                        continue
-                    relevance = clamp(
-                        0.50 * components["keyword_score"]
-                        + 0.30 * components["importance_score"]
-                        + 0.10 * components["recency_score"]
-                        + 0.10 * components["pinned_or_explicit_bonus"]
-                    )
-                    if relevance <= 0.05:
-                        continue
-                    reason = self.reason_for(memory, memory_type, components)
-                    inject_mode = self.inject_mode(relevance, memory)
-                    results.append(RetrievalResult(memory_type, memory, relevance, reason, inject_mode, components))
-            results.sort(key=lambda x: x.relevance, reverse=True)
-            selected = results[:limit]
-            if update_recall:
-                now = utc_now()
-                for item in selected:
-                    table = MEMORY_TABLES[item.memory_type]
-                    con.execute(f"UPDATE {table} SET last_recalled_at=?, updated_at=? WHERE id=?", (now, now, item.memory["id"]))
-                    con.execute(
-                        """
-                        INSERT INTO recall_history
-                        (id, memory_id, memory_type, query, reason, relevance, inject_mode, created_at)
-                        VALUES (?,?,?,?,?,?,?,?)
-                        """,
-                        (new_id("recall"), item.memory["id"], item.memory_type, query, item.reason, item.relevance, item.inject_mode, now),
-                    )
-        return selected
+        results = self.layered.retrieve(
+            query=query,
+            limit=limit,
+            include_archived=include_archived,
+            memory_types=memory_types,
+            update_recall=update_recall,
+        )
+        return [
+            RetrievalResult(
+                memory_type=item["memory_type"],
+                memory=item["memory"],
+                relevance=item["relevance"],
+                reason=item["reason"],
+                inject_mode=item["inject_mode"],
+                components=item["components"],
+            )
+            for item in results
+        ]
 
     def build_context(
         self,
@@ -1187,22 +1180,32 @@ class MemoryManager:
         char_budget: int = 3500,
     ) -> dict[str, Any]:
         retrieved = self.retrieve(query, limit=limit)
-        persistent = [r for r in retrieved if r.memory_type == "persistent"]
-        projects = [r for r in retrieved if r.memory_type == "project"]
-        episodes = [r for r in retrieved if r.memory_type == "episodic"]
+        stable = [
+            r
+            for r in retrieved
+            if r.memory.get("epistemic_status") == "confirmed"
+            or r.memory.get("acquisition_mode") == "user_explicit"
+        ]
+        stable_keys = {(r.memory_type, r.memory.get("id")) for r in stable}
+        projects = [
+            r for r in retrieved if r.memory_type == "prospective" and (r.memory_type, r.memory.get("id")) not in stable_keys
+        ]
+        episodes = [
+            r for r in retrieved if r.memory_type == "episodic" and (r.memory_type, r.memory.get("id")) not in stable_keys
+        ]
 
         sections: list[str] = []
-        if persistent:
-            sections.append("[Persistent user memory]\n" + "\n".join(f"- {r.memory['content']}" for r in persistent[:3]))
+        if stable:
+            sections.append("[Confirmed user memory]\n" + "\n".join(f"- {r.memory['content']}" for r in stable[:3]))
         if projects:
-            sections.append("[Active project memory]\n" + "\n".join(f"- {r.memory['title']}: {r.memory['summary']}" for r in projects[:3]))
+            sections.append("[Active project memory]\n" + "\n".join(f"- {r.memory['title']}: {r.memory['content']}" for r in projects[:3]))
         if episodes:
             lines = []
             for r in episodes[:4]:
                 if r.inject_mode == "reference_only":
                     lines.append(f"- {r.memory['title']}")
                 else:
-                    lines.append(f"- {r.memory['title']}: {r.memory['summary']}")
+                    lines.append(f"- {r.memory['title']}: {r.memory['content']}")
             sections.append("[Retrieved episodic memories]\n" + "\n".join(lines))
         if include_recent_raw and conversation_id:
             raw = self.recent_raw_messages(conversation_id, limit=6)
@@ -1232,18 +1235,24 @@ class MemoryManager:
         confirmed_keys = {
             (r.memory_type, r.memory.get("id"))
             for r in retrieved
-            if r.memory.get("evidence_type") == "explicit" or r.memory.get("user_confirmed")
+            if r.memory.get("epistemic_status") == "confirmed"
+            or r.memory.get("acquisition_mode") == "user_explicit"
         }
         groups = {
             "confirmed": [r for r in retrieved if (r.memory_type, r.memory.get("id")) in confirmed_keys],
-            "project": [r for r in retrieved if r.memory_type == "project" and (r.memory_type, r.memory.get("id")) not in confirmed_keys],
-            "episodic": [r for r in retrieved if r.memory_type == "episodic"],
+            "project": [r for r in retrieved if r.memory_type == "prospective" and (r.memory_type, r.memory.get("id")) not in confirmed_keys],
+            "episodic": [
+                r for r in retrieved if r.memory_type == "episodic" and (r.memory_type, r.memory.get("id")) not in confirmed_keys
+            ],
             "tentative": [
                 r
                 for r in retrieved
-                if r.memory_type != "project"
+                if r.memory_type != "prospective"
                 and r.memory_type != "episodic"
-                and not (r.memory.get("evidence_type") == "explicit" or r.memory.get("user_confirmed"))
+                and not (
+                    r.memory.get("epistemic_status") == "confirmed"
+                    or r.memory.get("acquisition_mode") == "user_explicit"
+                )
             ],
         }
 
@@ -1287,23 +1296,20 @@ class MemoryManager:
     def memory_context_line(self, result: RetrievalResult) -> str:
         memory = result.memory
         title = memory.get("title", memory.get("id", "memory"))
-        if result.memory_type == "persistent":
-            body = memory.get("content", "")
-        else:
-            body = memory.get("summary", "")
+        body = memory.get("content") or memory.get("summary", "")
         body = re.sub(r"\s+", " ", body).strip()
         if result.inject_mode == "reference_only" and len(body) > 120:
             body = body[:117].rstrip() + "..."
         elif len(body) > 360:
             body = body[:357].rstrip() + "..."
 
-        evidence = memory.get("evidence_type", "inferred")
-        confidence = memory.get("confidence", 0.5)
+        evidence = memory.get("epistemic_status", memory.get("evidence_type", "inferred"))
+        confidence = memory.get("epistemic_confidence", memory.get("confidence", 0.5))
         relevance = result.relevance
         flags = []
         if memory.get("pinned"):
             flags.append("pinned")
-        if memory.get("user_confirmed"):
+        if memory.get("epistemic_status") == "confirmed" or memory.get("user_confirmed"):
             flags.append("user_confirmed")
         if memory.get("source", {}).get("llm_suggested_pinned"):
             flags.append("llm_suggested_pinned")
@@ -1396,6 +1402,9 @@ class MemoryManager:
             if con.total_changes == 0:
                 raise KeyError(f"Memory not found: {memory_type}/{memory_id}")
             self.index_memory(con, memory_type, memory_id)
+            legacy_memory = self.get_memory_with_connection(con, memory_type, memory_id)
+            if legacy_memory:
+                self.layered.sync_legacy_memory(memory_type, legacy_memory, con=con)
         return self.get_memory(memory_type, memory_id)
 
     def get_memory(self, memory_type: str, memory_id: str) -> dict[str, Any]:
@@ -1409,6 +1418,9 @@ class MemoryManager:
     def forget_memory(self, memory_type: str, memory_id: str) -> None:
         table = MEMORY_TABLES[memory_type]
         with self.connect() as con:
+            if con.execute(f"SELECT 1 FROM {table} WHERE id=?", (memory_id,)).fetchone() is None:
+                raise KeyError(f"Memory not found: {memory_type}/{memory_id}")
+            self.layered.forget_legacy_memory(memory_type, memory_id, con)
             con.execute(f"DELETE FROM {table} WHERE id=?", (memory_id,))
             con.execute("DELETE FROM memory_fts WHERE memory_type=? AND memory_id=?", (memory_type, memory_id))
 
@@ -1510,6 +1522,12 @@ class MemoryManager:
                 con.execute(f"UPDATE {MEMORY_TABLES[memory_type]} SET archived=1, updated_at=? WHERE id=?", (now, source_id))
                 con.execute("DELETE FROM memory_fts WHERE memory_type=? AND memory_id=?", (memory_type, source_id))
             self.index_memory(con, memory_type, target_id)
+            target_memory = self.get_memory_with_connection(con, memory_type, target_id)
+            source_memory = self.get_memory_with_connection(con, memory_type, source_id)
+            if target_memory:
+                self.layered.sync_legacy_memory(memory_type, target_memory, con=con)
+            if source_memory:
+                self.layered.sync_legacy_memory(memory_type, source_memory, con=con)
 
         return self.get_memory(memory_type, target_id)
 
@@ -1727,9 +1745,129 @@ class MemoryManager:
             "components": result.components,
         }
 
+    def create_memory_trace(self, item: dict[str, Any]) -> dict[str, Any]:
+        return self.layered.create_trace(item)
+
+    def list_memory_traces(
+        self,
+        status: str | None = None,
+        conversation_id: str | None = None,
+        include_archived: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.layered.list_traces(
+            status=status,
+            conversation_id=conversation_id,
+            include_archived=include_archived,
+            limit=limit,
+        )
+
+    def get_memory_trace(self, trace_id: str) -> dict[str, Any]:
+        return self.layered.get_trace(trace_id)
+
+    def patch_memory_trace(self, trace_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        return self.layered.patch_trace(trace_id, patch)
+
+    def recall_memory_trace(self, trace_id: str) -> dict[str, Any]:
+        return self.layered.recall_trace(trace_id)
+
+    def review_memory_trace(
+        self,
+        trace_id: str,
+        decision: str,
+        memory_type: str | None = None,
+        title: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        return self.layered.review_trace(
+            trace_id,
+            decision=decision,
+            memory_type=memory_type,
+            title=title,
+            notes=notes,
+        )
+
+    def consolidate_memory_trace(
+        self,
+        trace_id: str,
+        memory_type: str | None = None,
+        title: str | None = None,
+        confirmed: bool = False,
+    ) -> dict[str, Any]:
+        return self.layered.consolidate_trace(trace_id, memory_type=memory_type, title=title, confirmed=confirmed)
+
+    def maintain_memory_layers(
+        self,
+        as_of: str | None = None,
+        daily_decay_rate: float = 0.90,
+        auto_consolidate: bool = False,
+        archive_below_threshold: bool = True,
+    ) -> dict[str, Any]:
+        return self.layered.run_maintenance(
+            as_of=as_of,
+            daily_decay_rate=daily_decay_rate,
+            auto_consolidate=auto_consolidate,
+            archive_below_threshold=archive_below_threshold,
+        )
+
+    def list_long_term_memories(
+        self,
+        memory_type: str | None = None,
+        epistemic_status: str | None = None,
+        include_archived: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return self.layered.list_memories(
+            memory_type=memory_type,
+            epistemic_status=epistemic_status,
+            include_archived=include_archived,
+            limit=limit,
+        )
+
+    def get_long_term_memory(self, memory_id: str) -> dict[str, Any]:
+        return self.layered.get_memory(memory_id)
+
+    def get_long_term_memory_evidence(self, memory_id: str) -> dict[str, Any]:
+        return self.layered.list_evidence_links(memory_id)
+
+    def patch_long_term_memory(self, memory_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        updated = self.layered.patch_memory(memory_id, patch)
+        legacy_type = updated.get("legacy_memory_type")
+        legacy_id = updated.get("legacy_memory_id")
+        if legacy_type in MEMORY_TABLES and legacy_id:
+            legacy_patch: dict[str, Any] = {}
+            if "title" in patch:
+                legacy_patch["title"] = updated["title"]
+            if "content" in patch:
+                legacy_patch["content" if legacy_type == "persistent" else "summary"] = updated["content"]
+            if "salience" in patch:
+                legacy_patch["importance_score"] = updated["salience"]
+            if "epistemic_confidence" in patch:
+                legacy_patch["confidence"] = updated["epistemic_confidence"]
+            for key in ("pinned", "archived"):
+                if key in patch:
+                    legacy_patch[key] = updated[key]
+            if "epistemic_status" in patch:
+                confirmed = updated["epistemic_status"] == "confirmed"
+                legacy_patch["wording_policy"] = "confirmed" if confirmed else "tentative"
+                legacy_patch["user_confirmed"] = confirmed
+            if legacy_patch:
+                self.patch_memory(legacy_type, legacy_id, legacy_patch)
+                updated = self.layered.get_memory(memory_id)
+        return updated
+
+    def forget_long_term_memory(self, memory_id: str) -> None:
+        memory = self.layered.get_memory(memory_id)
+        legacy_type = memory.get("legacy_memory_type")
+        legacy_id = memory.get("legacy_memory_id")
+        if legacy_type in MEMORY_TABLES and legacy_id:
+            self.forget_memory(legacy_type, legacy_id)
+        else:
+            self.layered.forget_memory(memory_id)
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as con:
-            return {
+            stats = {
                 "db_path": str(self.db_path),
                 "lmstudio_base_url": self.lmstudio_base_url,
                 "raw_messages": con.execute("SELECT count(*) FROM raw_messages").fetchone()[0],
@@ -1739,3 +1877,5 @@ class MemoryManager:
                 "persistent_memories": con.execute("SELECT count(*) FROM persistent_memories").fetchone()[0],
                 "recall_history": con.execute("SELECT count(*) FROM recall_history").fetchone()[0],
             }
+        stats.update(self.layered.stats())
+        return stats

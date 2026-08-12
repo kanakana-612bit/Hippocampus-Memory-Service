@@ -3,21 +3,67 @@ __pycache__/
 *$py.class
 
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 
 data/
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 
 logs/
 *.log
 
+# Runtime data and private conversation exports must never enter any branch.
+backups/
+exports/
+generated/
+generations/
+media/
+outputs/
+recordings/
+uploads/
+cache/
+.cache/
+tmp/
+*.jsonl
+*.ndjson
+*.bak
+*.backup
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Generated media is excluded by default. Curated public documentation assets
+# must be reviewed and placed under docs/assets/.
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.mp4
+*.webm
+!docs/assets/
+!docs/assets/**
+
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+tmp-tests/
 
 dist/
 build/
 *.egg-info/
+
+# This combined local integration plan belongs to the Private branch only.
+docs/langgraph-integration-plan.ja.md
