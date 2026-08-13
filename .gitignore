@@ -39,6 +39,10 @@ tmp/
 *.7z
 *.tar
 *.tar.gz
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Generated media is excluded by default. Curated public documentation assets
 # must be reviewed and placed under docs/assets/.

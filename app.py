@@ -15,7 +15,7 @@ class UTF8JSONResponse(JSONResponse):
 
 app = FastAPI(
     title="Hippocampus Memory Service",
-    version="0.2.0",
+    version="0.7.0",
     description="Layered short-term and long-term memory service for local chat frontends.",
     default_response_class=UTF8JSONResponse,
 )
@@ -28,12 +28,27 @@ class MessageIn(BaseModel):
     role: str = "user"
     content: str
     created_at: str | None = None
+    event_time: str | None = None
+    source_time: str | None = None
+    timezone: str | None = None
+    time_source: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    source_channel: str | None = None
+    content_origin: Literal["original", "quoted", "summary", "inferred", "generated", "derived"] | None = None
+    extractor: str | None = None
+    derived_from: list[dict[str, str]] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class IngestRequest(BaseModel):
     conversation_id: str
     messages: list[MessageIn]
+    auto_capture: bool = True
+    capture_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+    default_timezone: str | None = None
 
 
 class RetrieveRequest(BaseModel):
@@ -44,6 +59,8 @@ class RetrieveRequest(BaseModel):
         Literal["episodic", "semantic", "prospective", "procedural", "embodied", "project", "persistent"]
     ] | None = None
     update_recall: bool = True
+    temporal_scope: Literal["auto", "current", "historical", "future", "all"] = "auto"
+    as_of: str | None = None
 
 
 class ContextRequest(BaseModel):
@@ -52,6 +69,9 @@ class ContextRequest(BaseModel):
     include_recent_raw: bool = False
     conversation_id: str | None = None
     char_budget: int = Field(default=3500, ge=500, le=12000)
+    timezone: str | None = None
+    as_of: str | None = None
+    temporal_scope: Literal["auto", "current", "historical", "future", "all"] = "auto"
 
 
 class ConsolidateRequest(BaseModel):
@@ -97,6 +117,11 @@ class RememberRequest(BaseModel):
     source: dict[str, Any] = Field(default_factory=dict)
     dedupe: bool = True
     update_existing: bool = True
+    event_time: str | None = None
+    source_time: str | None = None
+    timezone: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
 
 
 class PersistentDuplicateRequest(BaseModel):
@@ -139,6 +164,30 @@ class MemoryTraceCreate(BaseModel):
     stability: float = Field(default=0.1, ge=0.0, le=1.0)
     continuity_score: float = Field(default=0.0, ge=0.0, le=1.0)
     affect_signal: dict[str, Any] = Field(default_factory=dict)
+    capture_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    repetition_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    unfinished_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    confirmation_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    occurrence_count: int = Field(default=1, ge=1)
+    extraction_reasons: list[str] = Field(default_factory=list)
+    content_fingerprint: str = ""
+    first_observed_at: str | None = None
+    last_observed_at: str | None = None
+    event_time: str | None = None
+    received_at: str | None = None
+    persisted_at: str | None = None
+    source_time: str | None = None
+    timezone: str | None = None
+    time_source: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    superseded_by: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    source_channel: str | None = None
+    content_origin: Literal["original", "quoted", "summary", "inferred", "generated", "derived"] | None = None
+    extractor: str | None = None
+    derived_from: list[dict[str, str]] = Field(default_factory=list)
     evidence_summary: str = ""
     source_event_ids: list[str] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
@@ -168,6 +217,30 @@ class MemoryTracePatch(BaseModel):
     stability: float | None = Field(default=None, ge=0.0, le=1.0)
     continuity_score: float | None = Field(default=None, ge=0.0, le=1.0)
     affect_signal: dict[str, Any] | None = None
+    capture_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    repetition_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    unfinished_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    confirmation_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    occurrence_count: int | None = Field(default=None, ge=1)
+    extraction_reasons: list[str] | None = None
+    content_fingerprint: str | None = None
+    first_observed_at: str | None = None
+    last_observed_at: str | None = None
+    event_time: str | None = None
+    received_at: str | None = None
+    persisted_at: str | None = None
+    source_time: str | None = None
+    timezone: str | None = None
+    time_source: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    superseded_by: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    source_channel: str | None = None
+    content_origin: Literal["original", "quoted", "summary", "inferred", "generated", "derived"] | None = None
+    extractor: str | None = None
+    derived_from: list[dict[str, str]] | None = None
     evidence_summary: str | None = None
     source_event_ids: list[str] | None = None
     source: dict[str, Any] | None = None
@@ -230,11 +303,242 @@ class LongTermMemoryPatch(BaseModel):
     source_reliability: float | None = Field(default=None, ge=0.0, le=1.0)
     world_hypothesis: str | None = None
     expires_at: str | None = None
+    event_time: str | None = None
+    received_at: str | None = None
+    persisted_at: str | None = None
+    source_time: str | None = None
+    timezone: str | None = None
+    time_source: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
+    superseded_by: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    source_channel: str | None = None
+    content_origin: Literal["original", "quoted", "summary", "inferred", "generated", "derived"] | None = None
+    extractor: str | None = None
+    derived_from: list[dict[str, str]] | None = None
+
+
+class SupersedeMemoryRequest(BaseModel):
+    replacement_memory_id: str
+    effective_at: str | None = None
+
+
+class CheckpointRequest(BaseModel):
+    reason: str = Field(default="manual", min_length=1, max_length=120)
+
+
+class BackupCreateRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=40)
+
+
+class BackupFileRequest(BaseModel):
+    filename: str = Field(min_length=4, max_length=255)
+
+
+class AttributionClaimIn(BaseModel):
+    claim_id: str | None = None
+    sentence: str | None = None
+    claimed_actor_role: Literal["user", "assistant", "system"]
+    claim_kind: Literal["speech", "request", "preference", "belief", "proposal"] = "speech"
+    statement: str
+    event_ids: list[str] = Field(default_factory=list)
+    memory_ids: list[str] = Field(default_factory=list)
+
+
+class AttributionValidateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100000)
+    conversation_id: str | None = None
+    event_ids: list[str] = Field(default_factory=list, max_length=200)
+    memory_ids: list[str] = Field(default_factory=list, max_length=100)
+    claims: list[AttributionClaimIn] | None = Field(default=None, max_length=100)
+    threshold: float = Field(default=0.46, ge=0.20, le=0.95)
+
+
+class ResponseCandidateIn(BaseModel):
+    candidate_id: str | None = None
+    content: str = Field(min_length=1, max_length=100000)
+    quality_score: float = 0.0
+    claims: list[AttributionClaimIn] | None = Field(default=None, max_length=100)
+
+
+class CandidateSelectRequest(BaseModel):
+    candidates: list[ResponseCandidateIn] = Field(min_length=1, max_length=12)
+    conversation_id: str | None = None
+    event_ids: list[str] = Field(default_factory=list, max_length=200)
+    memory_ids: list[str] = Field(default_factory=list, max_length=100)
+    threshold: float = Field(default=0.46, ge=0.20, le=0.95)
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, **manager.stats()}
+
+
+@app.get("/status/phase1")
+def phase1_status() -> dict[str, Any]:
+    return manager.phase1_status()
+
+
+@app.get("/status/phase2")
+def phase2_status() -> dict[str, Any]:
+    return manager.phase2_status()
+
+
+@app.get("/status/phase3")
+def phase3_status() -> dict[str, Any]:
+    return manager.phase3_status()
+
+
+@app.get("/status/phase4")
+def phase4_status() -> dict[str, Any]:
+    return manager.phase4_status()
+
+
+@app.get("/status/phase5")
+def phase5_status() -> dict[str, Any]:
+    return manager.phase5_status()
+
+
+@app.get("/status/attribution-gate")
+def attribution_gate_status() -> dict[str, Any]:
+    return manager.attribution_gate_status()
+
+
+@app.post("/attribution/validate")
+def validate_response_attribution(req: AttributionValidateRequest) -> dict[str, Any]:
+    return manager.validate_response_attribution(
+        content=req.content,
+        conversation_id=req.conversation_id,
+        event_ids=req.event_ids,
+        memory_ids=req.memory_ids,
+        claims=(
+            [claim.model_dump(exclude_none=True) for claim in req.claims]
+            if req.claims is not None
+            else None
+        ),
+        threshold=req.threshold,
+    )
+
+
+@app.post("/response/candidates/select")
+def select_response_candidate(req: CandidateSelectRequest) -> dict[str, Any]:
+    return manager.select_response_candidate(
+        candidates=[candidate.model_dump(exclude_none=True) for candidate in req.candidates],
+        conversation_id=req.conversation_id,
+        event_ids=req.event_ids,
+        memory_ids=req.memory_ids,
+        threshold=req.threshold,
+    )
+
+
+@app.post("/audit/checkpoints")
+def create_signed_checkpoint(req: CheckpointRequest) -> dict[str, Any]:
+    try:
+        return manager.create_signed_checkpoint(reason=req.reason)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/audit/checkpoints")
+def list_signed_checkpoints(
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> dict[str, Any]:
+    return {"checkpoints": manager.list_checkpoints(limit=limit)}
+
+
+@app.get("/audit/checkpoints/verify")
+def verify_signed_checkpoints() -> dict[str, Any]:
+    return manager.verify_checkpoints()
+
+
+@app.get("/audit/keys")
+def list_signing_keys() -> dict[str, Any]:
+    return {"keys": manager.list_signing_keys()}
+
+
+@app.post("/audit/keys/rotate")
+def rotate_signing_key() -> dict[str, Any]:
+    try:
+        return manager.rotate_signing_key()
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/audit/branches")
+def list_audit_branches() -> dict[str, Any]:
+    return {"branches": manager.list_audit_branches()}
+
+
+@app.post("/backups")
+def create_signed_backup(req: BackupCreateRequest) -> dict[str, Any]:
+    try:
+        return manager.create_signed_backup(label=req.label)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/backups/verify")
+def verify_signed_backup(req: BackupFileRequest) -> dict[str, Any]:
+    try:
+        return manager.verify_signed_backup(req.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/restores/plan")
+def plan_backup_restore(req: BackupFileRequest) -> dict[str, Any]:
+    try:
+        return manager.plan_backup_restore(req.filename)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/audit/verify")
+def verify_audit(verify_objects: bool = True) -> dict[str, Any]:
+    return manager.verify_audit(verify_objects=verify_objects)
+
+
+@app.get("/audit/events")
+def list_audit_events(
+    object_type: Literal["raw_message", "memory_trace", "memory"] | None = None,
+    object_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    include_payload: bool = False,
+) -> dict[str, Any]:
+    return {
+        "events": manager.list_audit_events(
+            object_type=object_type,
+            object_id=object_id,
+            limit=limit,
+            include_payload=include_payload,
+        )
+    }
+
+
+@app.get("/provenance/{object_type}/{object_id}")
+def get_provenance(
+    object_type: Literal["raw_message", "memory_trace", "memory"],
+    object_id: str,
+) -> dict[str, Any]:
+    return manager.get_provenance(object_type, object_id)
+
+
+@app.get("/temporal/context")
+def temporal_context(
+    conversation_id: str | None = None,
+    timezone: str | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return manager.build_temporal_context(
+            conversation_id=conversation_id,
+            timezone=timezone,
+            as_of=as_of,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/seed")
@@ -247,7 +551,16 @@ def seed(req: SeedRequest) -> dict[str, Any]:
 
 @app.post("/memory/ingest")
 def ingest(req: IngestRequest) -> dict[str, Any]:
-    return manager.ingest_messages(req.conversation_id, [m.model_dump(exclude_none=True) for m in req.messages])
+    try:
+        return manager.ingest_messages(
+            req.conversation_id,
+            [m.model_dump(exclude_none=True) for m in req.messages],
+            auto_capture=req.auto_capture,
+            capture_threshold=req.capture_threshold,
+            default_timezone=req.default_timezone,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/learn/openwebui/chat/{chat_id}")
@@ -297,6 +610,11 @@ def remember(req: RememberRequest) -> dict[str, Any]:
             source=req.source,
             dedupe=req.dedupe,
             update_existing=req.update_existing,
+            event_time=req.event_time,
+            source_time=req.source_time,
+            timezone=req.timezone,
+            valid_from=req.valid_from,
+            valid_until=req.valid_until,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -321,25 +639,36 @@ def consolidate(req: ConsolidateRequest) -> dict[str, Any]:
 
 @app.post("/memory/retrieve")
 def retrieve(req: RetrieveRequest) -> dict[str, Any]:
-    results = manager.retrieve(
-        req.query,
-        limit=req.limit,
-        include_archived=req.include_archived,
-        memory_types=req.memory_types,
-        update_recall=req.update_recall,
-    )
-    return {"retrieved": [manager.result_to_dict(r) for r in results]}
+    try:
+        results = manager.retrieve(
+            req.query,
+            limit=req.limit,
+            include_archived=req.include_archived,
+            memory_types=req.memory_types,
+            update_recall=req.update_recall,
+            temporal_scope=req.temporal_scope,
+            as_of=req.as_of,
+        )
+        return {"retrieved": [manager.result_to_dict(r) for r in results]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/context/build")
 def build_context(req: ContextRequest) -> dict[str, Any]:
-    return manager.build_context(
-        req.query,
-        limit=req.limit,
-        include_recent_raw=req.include_recent_raw,
-        conversation_id=req.conversation_id,
-        char_budget=req.char_budget,
-    )
+    try:
+        return manager.build_context(
+            req.query,
+            limit=req.limit,
+            include_recent_raw=req.include_recent_raw,
+            conversation_id=req.conversation_id,
+            char_budget=req.char_budget,
+            timezone=req.timezone,
+            as_of=req.as_of,
+            temporal_scope=req.temporal_scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/memory/traces")
@@ -446,6 +775,8 @@ def retrieve_long_term_memories(req: RetrieveRequest) -> dict[str, Any]:
             include_archived=req.include_archived,
             memory_types=req.memory_types,
             update_recall=req.update_recall,
+            temporal_scope=req.temporal_scope,
+            as_of=req.as_of,
         )
         return {"retrieved": [manager.result_to_dict(result) for result in results]}
     except ValueError as exc:
@@ -458,6 +789,8 @@ def list_long_term_memories(
     epistemic_status: Literal["observed", "inferred", "confirmed", "disputed"] | None = None,
     include_archived: bool = False,
     limit: int = Query(default=200, ge=1, le=1000),
+    temporal_scope: Literal["current", "historical", "future", "all"] = "current",
+    as_of: str | None = None,
 ) -> dict[str, Any]:
     return {
         "memories": manager.list_long_term_memories(
@@ -465,6 +798,8 @@ def list_long_term_memories(
             epistemic_status=epistemic_status,
             include_archived=include_archived,
             limit=limit,
+            temporal_scope=temporal_scope,
+            as_of=as_of,
         )
     }
 
@@ -489,6 +824,20 @@ def get_long_term_memory_evidence(memory_id: str) -> dict[str, Any]:
 def patch_long_term_memory(memory_id: str, patch: LongTermMemoryPatch) -> dict[str, Any]:
     try:
         return manager.patch_long_term_memory(memory_id, patch.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memories/{memory_id}/supersede")
+def supersede_long_term_memory(memory_id: str, req: SupersedeMemoryRequest) -> dict[str, Any]:
+    try:
+        return manager.supersede_long_term_memory(
+            memory_id,
+            req.replacement_memory_id,
+            effective_at=req.effective_at,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

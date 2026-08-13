@@ -13,5 +13,9 @@ Before publishing, syncing, or sharing a deployment:
 - Provide a review and delete path before using this with other people.
 - If you import OpenWebUI chats, inspect generated memories before pinning them.
 - Run `python scripts/check_public_tree.py` before pushing. The same check runs in CI.
+- Never commit Phase 5 private signing keys, passphrases, external anchors, or
+  signed backup files. Keep the security and backup directories outside source
+  control and protect checkpoint, key-rotation, backup, and restore operations
+  as administrative functions.
 
 The bundled `seed_memories.json` contains fictional demo data only.

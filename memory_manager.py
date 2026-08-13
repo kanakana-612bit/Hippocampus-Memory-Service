@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -13,7 +14,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from automatic_memory import (
+    DEFAULT_CAPTURE_THRESHOLD,
+    analyze_user_message,
+    apply_repetition,
+    content_fingerprint,
+    term_similarity,
+)
 from layered_memory import ClosingConnection, LayeredMemoryStore
+from temporal_memory import (
+    duration_text,
+    infer_temporal_window,
+    local_timestamp,
+    normalize_timestamp,
+    optional_timestamp,
+    seconds_between,
+    temporal_state,
+    timezone_name,
+    validate_window,
+)
 
 try:
     import yaml
@@ -76,12 +95,12 @@ PROJECT_TERMS = (
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def from_unix(value: Any) -> str:
     try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="seconds")
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="milliseconds")
     except Exception:
         return utc_now()
 
@@ -154,6 +173,31 @@ def has_recall_trigger(text: str) -> bool:
     return any(trigger in normalized for trigger in triggers)
 
 
+def temporal_scope_for_query(query: str, requested: str = "auto") -> str:
+    if requested != "auto":
+        return requested
+    normalized = normalize_text(query)
+    broaden = (
+        "以前",
+        "前は",
+        "昔",
+        "当時",
+        "過去",
+        "履歴",
+        "明日",
+        "来週",
+        "来月",
+        "今後",
+        "予定",
+        "previously",
+        "historical",
+        "tomorrow",
+        "next week",
+        "future",
+    )
+    return "all" if any(term in normalized for term in broaden) else "current"
+
+
 def tentative(text: str) -> str:
     stripped = text.strip()
     if not stripped:
@@ -180,6 +224,7 @@ class MemoryManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.lmstudio_base_url = os.getenv("LMSTUDIO_BASE_URL", DEFAULT_LMSTUDIO_BASE_URL)
         self.llm_model = os.getenv("HIPPOCAMPUS_LLM_MODEL", DEFAULT_LLM_MODEL)
+        self.default_timezone = timezone_name(os.getenv("HIPPOCAMPUS_TIMEZONE", "UTC"))
         self.layered = LayeredMemoryStore(self.db_path)
         self.init_db()
 
@@ -193,6 +238,7 @@ class MemoryManager:
         with self.connect() as con:
             con.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
             self.layered.initialize(con)
+        self.layered.ensure_phase5_ready()
 
     def seed(self, seed_path: str | Path | None = None, overwrite: bool = False) -> dict[str, int]:
         path = Path(seed_path or ROOT / "seed_memories.json")
@@ -228,7 +274,11 @@ class MemoryManager:
             "project_memories": self.list_memories("project", include_archived=True),
             "persistent_memories": self.list_memories("persistent", include_archived=True),
             "memory_traces": self.layered.list_traces(include_archived=True, limit=1000),
-            "memories": self.layered.list_memories(include_archived=True, limit=1000),
+            "memories": self.layered.list_memories(
+                include_archived=True,
+                limit=1000,
+                temporal_scope="all",
+            ),
         }
         if path:
             out = Path(path)
@@ -459,6 +509,11 @@ class MemoryManager:
         importance_score: float = 0.95,
         dedupe: bool = True,
         update_existing: bool = True,
+        event_time: str | None = None,
+        source_time: str | None = None,
+        timezone: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
     ) -> dict[str, Any]:
         clean_content = content.strip()
         if not clean_content:
@@ -466,6 +521,20 @@ class MemoryManager:
         memory_keywords = unique_list(keywords or [], query_terms(clean_content))
         scoped_source = dict(source or {})
         scoped_source["scope"] = scope
+        zone = timezone_name(timezone or self.default_timezone)
+        temporal_patch: dict[str, Any] = {"timezone": zone}
+        if event_time:
+            temporal_patch["event_time"] = normalize_timestamp(event_time, zone, field_name="event_time")
+            temporal_patch["time_source"] = "user_provided"
+        if source_time:
+            temporal_patch["source_time"] = normalize_timestamp(source_time, zone, field_name="source_time")
+        normalized_valid_from = optional_timestamp(valid_from, zone, field_name="valid_from")
+        normalized_valid_until = optional_timestamp(valid_until, zone, field_name="valid_until")
+        validate_window(normalized_valid_from, normalized_valid_until)
+        if normalized_valid_from:
+            temporal_patch["valid_from"] = normalized_valid_from
+        if normalized_valid_until:
+            temporal_patch["valid_until"] = normalized_valid_until
 
         duplicate = self.find_persistent_duplicate(clean_content, memory_keywords) if dedupe else None
         if duplicate and update_existing:
@@ -495,6 +564,8 @@ class MemoryManager:
                 legacy_memory = self.get_memory_with_connection(con, "persistent", duplicate["id"])
                 if legacy_memory:
                     self.layered.sync_legacy_memory("persistent", legacy_memory, con=con)
+            if len(temporal_patch) > 1 or timezone:
+                self.layered.patch_memory(duplicate["id"], temporal_patch)
             return {
                 "action": "updated",
                 "memory": self.get_memory("persistent", duplicate["id"]),
@@ -516,6 +587,8 @@ class MemoryManager:
             "user_confirmed": True,
         }
         self.upsert_persistent(item)
+        if len(temporal_patch) > 1 or timezone:
+            self.layered.patch_memory(item["id"], temporal_patch)
         return {
             "action": "created",
             "memory": self.get_memory("persistent", item["id"]),
@@ -607,48 +680,550 @@ class MemoryManager:
             if own:
                 con.close()
 
-    def ingest_messages(self, conversation_id: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        created: list[str] = []
-        persistent: list[str] = []
+    def ingest_messages(
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        auto_capture: bool = True,
+        capture_threshold: float = DEFAULT_CAPTURE_THRESHOLD,
+        default_timezone: str | None = None,
+    ) -> dict[str, Any]:
+        started_monotonic = time.monotonic()
+        threshold = clamp(capture_threshold)
+        batch_timezone = timezone_name(default_timezone or self.default_timezone)
+        normalized_messages: list[dict[str, Any]] = []
+        existing_message_ids: set[str] = set()
+        existing_messages: dict[str, dict[str, Any]] = {}
+        prior_messages: list[dict[str, Any]] = []
+
         with self.connect() as con:
+            incoming_ids = [str(message["id"]) for message in messages if message.get("id")]
+            if incoming_ids:
+                placeholders = ",".join("?" for _ in incoming_ids)
+                existing_rows = con.execute(
+                    f"SELECT * FROM raw_messages WHERE id IN ({placeholders})",
+                    incoming_ids,
+                ).fetchall()
+                existing_messages = {str(row["id"]): dict(row) for row in existing_rows}
+                existing_message_ids = set(existing_messages)
+            prior_rows = con.execute(
+                """
+                SELECT id, conversation_id, role, content, event_time, received_at,
+                       persisted_at, source_time, timezone, time_source,
+                       event_sequence, ingest_delay_seconds, created_at
+                FROM raw_messages
+                ORDER BY persisted_at DESC, created_at DESC
+                LIMIT 400
+                """
+            ).fetchall()
+            prior_messages = [dict(row) for row in reversed(prior_rows)]
+            next_sequence = int(
+                con.execute(
+                    "SELECT COALESCE(MAX(event_sequence), 0) FROM raw_messages WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+
             for message in messages:
-                msg_id = message.get("id") or new_id("msg")
-                created_at = message.get("created_at") or utc_now()
+                msg_id = str(message.get("id") or new_id("msg"))
+                existing = existing_messages.get(msg_id)
+                received_at = utc_now()
+                zone = timezone_name(message.get("timezone") or (message.get("meta") or {}).get("timezone") or batch_timezone)
+                source_value = message.get("source_time") or message.get("created_at")
+                event_value = message.get("event_time") or message.get("created_at") or source_value or received_at
+                event_time = normalize_timestamp(event_value, zone, field_name="event_time")
+                source_time = optional_timestamp(source_value, zone, field_name="source_time") or event_time
+                persisted_at = utc_now()
+                time_source = str(
+                    message.get("time_source")
+                    or ("source_provided" if message.get("event_time") or source_value else "ingest_fallback")
+                )
+                if existing:
+                    incoming_meta = dict(message.get("meta") or {})
+                    incoming_actor_id = message.get("actor_id") or incoming_meta.get("actor_id") or incoming_meta.get("user_id")
+                    incoming_actor_role = str(
+                        message.get("actor_role")
+                        or incoming_meta.get("actor_role")
+                        or message.get("role", "user")
+                    )
+                    if (
+                        str(existing.get("conversation_id")) != conversation_id
+                        or str(existing.get("role")) != str(message.get("role", "user"))
+                        or str(existing.get("content")) != str(message.get("content", ""))
+                        or (incoming_actor_id is not None and existing.get("actor_id") != incoming_actor_id)
+                        or str(existing.get("actor_role") or existing.get("role")) != incoming_actor_role
+                    ):
+                        raise ValueError(
+                            f"Source event id {msg_id} already exists with different content or attribution."
+                        )
+                    event_time = existing.get("event_time") or existing["created_at"]
+                    received_at = existing.get("received_at") or existing["created_at"]
+                    persisted_at = existing.get("persisted_at") or existing["created_at"]
+                    source_time = existing.get("source_time") or event_time
+                    zone = existing.get("timezone") or zone
+                    time_source = existing.get("time_source") or time_source
+                    sequence = existing.get("event_sequence")
+                else:
+                    next_sequence += 1
+                    sequence = next_sequence
+                valid_from = optional_timestamp(message.get("valid_from"), zone, field_name="valid_from")
+                valid_until = optional_timestamp(message.get("valid_until"), zone, field_name="valid_until")
+                validate_window(valid_from, valid_until)
+                normalized = {
+                    "id": msg_id,
+                    "conversation_id": conversation_id,
+                    "role": str(message.get("role", "user")),
+                    "content": str(message.get("content", "")),
+                    "event_time": event_time,
+                    "received_at": received_at,
+                    "persisted_at": persisted_at,
+                    "source_time": source_time,
+                    "timezone": zone,
+                    "time_source": time_source,
+                    "event_sequence": sequence,
+                    "ingest_delay_seconds": seconds_between(received_at, event_time) or 0.0,
+                    "valid_from": valid_from,
+                    "valid_until": valid_until,
+                    "created_at": event_time,
+                    "meta": dict(message.get("meta") or {}),
+                }
+                meta = normalized["meta"]
+                actor_id = message.get("actor_id") or meta.get("actor_id") or meta.get("user_id")
+                actor_role = str(message.get("actor_role") or meta.get("actor_role") or normalized["role"])
+                source_channel = str(
+                    message.get("source_channel")
+                    or meta.get("source_channel")
+                    or meta.get("source")
+                    or "api"
+                )
+                content_origin = str(message.get("content_origin") or meta.get("content_origin") or "original")
+                extractor = message.get("extractor") or meta.get("extractor")
+                derived_from = message.get("derived_from") or meta.get("derived_from") or []
+                normalized.update(
+                    {
+                        "actor_id": actor_id,
+                        "actor_role": actor_role,
+                        "source_channel": source_channel,
+                        "content_origin": content_origin,
+                        "extractor": extractor,
+                        "derived_from": derived_from,
+                    }
+                )
                 con.execute(
                     """
-                    INSERT OR REPLACE INTO raw_messages
-                    (id, conversation_id, role, content, created_at, meta_json)
-                    VALUES (?,?,?,?,?,?)
+                    INSERT OR IGNORE INTO raw_messages
+                    (id, conversation_id, role, content, event_time, received_at,
+                     persisted_at, source_time, timezone, time_source, event_sequence,
+                     ingest_delay_seconds, actor_id, actor_role, source_channel,
+                     content_origin, extractor, derived_from_json, created_at, meta_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         msg_id,
                         conversation_id,
-                        message.get("role", "user"),
-                        message.get("content", ""),
-                        created_at,
-                        dumps(message.get("meta", {})),
+                        normalized["role"],
+                        normalized["content"],
+                        event_time,
+                        received_at,
+                        persisted_at,
+                        source_time,
+                        zone,
+                        time_source,
+                        sequence,
+                        normalized["ingest_delay_seconds"],
+                        actor_id,
+                        actor_role,
+                        source_channel,
+                        content_origin,
+                        extractor,
+                        dumps(derived_from),
+                        event_time,
+                        dumps(normalized["meta"]),
                     ),
                 )
-                created.append(msg_id)
-                explicit = self.extract_explicit_memory(message.get("content", ""))
-                if explicit and message.get("role", "user") == "user":
-                    item = {
-                        "id": new_id("persistent"),
-                        "title": explicit[:40],
-                        "content": explicit,
-                        "category": "explicit_user_instruction",
-                        "keywords": query_terms(explicit),
-                        "importance_score": 0.95,
-                        "pinned": True,
-                        "source": {"conversation_id": conversation_id, "message_id": msg_id},
-                        "confidence": 1.0,
-                        "evidence_type": "explicit",
-                        "wording_policy": "confirmed",
-                        "user_confirmed": True,
+                if not existing and self.layered.audit_enabled(con):
+                    self.layered.audit.append_object_event(
+                        con,
+                        event_type="raw_message.ingested",
+                        object_type="raw_message",
+                        object_id=msg_id,
+                        actor_id=actor_id,
+                        actor_role=actor_role,
+                        source_channel=source_channel,
+                        content_origin=content_origin,
+                        extractor=extractor,
+                        derivations=derived_from,
+                        event_time=event_time,
+                        received_at=received_at,
+                        integrity_tier="routine",
+                        payload={"conversation_id": conversation_id, "role": actor_role},
+                    )
+                normalized_messages.append(normalized)
+
+        persistent: list[str] = []
+        explicit_message_ids: set[str] = set()
+        for message in normalized_messages:
+            if message["role"] != "user":
+                continue
+            explicit = self.extract_explicit_memory(message["content"])
+            if not explicit:
+                continue
+            explicit_message_ids.add(message["id"])
+            remembered = self.remember(
+                content=explicit,
+                title=explicit[:40],
+                category="explicit_user_instruction",
+                keywords=query_terms(explicit),
+                source={
+                    "conversation_id": conversation_id,
+                    "message_id": message["id"],
+                    "actor_id": message.get("actor_id"),
+                    "actor_role": message.get("actor_role") or "user",
+                    "source_channel": message.get("source_channel") or "api",
+                    "content_origin": "original",
+                },
+                importance_score=0.95,
+                dedupe=True,
+                update_existing=True,
+            )
+            self.layered.patch_memory(
+                remembered["memory"]["id"],
+                {
+                    "event_time": message["event_time"],
+                    "received_at": message["received_at"],
+                    "source_time": message["source_time"],
+                    "timezone": message["timezone"],
+                    "time_source": message["time_source"],
+                    "valid_from": message.get("valid_from"),
+                    "valid_until": message.get("valid_until"),
+                },
+            )
+            persistent.append(remembered["memory"]["id"])
+
+        capture = {
+            "enabled": auto_capture,
+            "threshold": threshold,
+            "created": 0,
+            "reinforced": 0,
+            "skipped": 0,
+            "trace_ids": [],
+            "details": [],
+        }
+        if auto_capture:
+            capture = self.capture_automatic_memories(
+                conversation_id=conversation_id,
+                messages=normalized_messages,
+                prior_messages=prior_messages,
+                existing_message_ids=existing_message_ids,
+                explicit_message_ids=explicit_message_ids,
+                capture_threshold=threshold,
+            )
+
+        return {
+            "raw_messages": [message["id"] for message in normalized_messages],
+            "persistent_memories": unique_list(persistent),
+            "memory_traces": capture["trace_ids"],
+            "automatic_capture": capture,
+            "temporal_ingest": {
+                "timezone": batch_timezone,
+                "event_count": len(normalized_messages),
+                "historical_event_count": sum(
+                    1
+                    for message in normalized_messages
+                    if float(message.get("ingest_delay_seconds", 0.0)) > 60.0
+                ),
+                "processing_elapsed_ms": round((time.monotonic() - started_monotonic) * 1000.0, 3),
+                "duration_clock": "monotonic",
+            },
+        }
+
+    def capture_automatic_memories(
+        self,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        prior_messages: list[dict[str, Any]],
+        existing_message_ids: set[str],
+        explicit_message_ids: set[str],
+        capture_threshold: float,
+    ) -> dict[str, Any]:
+        report: dict[str, Any] = {
+            "enabled": True,
+            "threshold": capture_threshold,
+            "created": 0,
+            "reinforced": 0,
+            "skipped": 0,
+            "trace_ids": [],
+            "details": [],
+        }
+        history = list(prior_messages)
+        previous_assistant = next(
+            (
+                item
+                for item in reversed(history)
+                if item.get("conversation_id") == conversation_id and item.get("role") == "assistant"
+            ),
+            None,
+        )
+
+        for message in messages:
+            message_id = message["id"]
+            role = message["role"]
+            if role == "assistant":
+                previous_assistant = message
+                history.append(message)
+                continue
+            if role != "user":
+                history.append(message)
+                continue
+            if message_id in existing_message_ids:
+                self._record_capture_skip(report, message_id, "source_event_already_ingested")
+                history.append(message)
+                continue
+            if message_id in explicit_message_ids:
+                self._record_capture_skip(report, message_id, "explicit_memory_route")
+                history.append(message)
+                continue
+
+            analysis = analyze_user_message(
+                message["content"],
+                previous_assistant=previous_assistant.get("content") if previous_assistant else None,
+            )
+            if not analysis.get("raw_content"):
+                self._record_capture_skip(report, message_id, "empty_message")
+                history.append(message)
+                continue
+
+            keywords = query_terms(str(analysis["raw_content"]))
+            repetition_score = self.repetition_score(
+                content=str(analysis["raw_content"]),
+                keywords=keywords,
+                history=history,
+                current_message_id=message_id,
+            )
+            analysis = apply_repetition(analysis, repetition_score)
+            temporal_hint: dict[str, Any] = {}
+            if analysis.get("candidate_memory_type") == "prospective":
+                temporal_hint = infer_temporal_window(
+                    message["content"],
+                    message["event_time"],
+                    message["timezone"],
+                )
+                if temporal_hint:
+                    reasons = list(analysis.get("reasons") or [])
+                    if "temporal_expression" not in reasons:
+                        reasons.append("temporal_expression")
+                    analysis["reasons"] = reasons
+                    analysis["temporal_hint"] = temporal_hint
+            if not analysis.get("eligible") or float(analysis.get("capture_score", 0.0)) < capture_threshold:
+                self._record_capture_skip(report, message_id, "below_capture_threshold")
+                history.append(message)
+                continue
+
+            source_event_ids = [message_id]
+            if analysis.get("confirmation_score") and previous_assistant:
+                source_event_ids.insert(0, str(previous_assistant["id"]))
+            existing_trace = self.find_reinforceable_trace(
+                fingerprint=str(analysis["fingerprint"]),
+                keywords=keywords,
+                candidate_memory_type=str(analysis["candidate_memory_type"]),
+            )
+            if existing_trace:
+                trace = self.reinforce_automatic_trace(
+                    existing_trace,
+                    analysis=analysis,
+                    source_event_ids=source_event_ids,
+                    observed_at=message["created_at"],
+                )
+                action = "reinforced"
+            else:
+                trace = self.create_automatic_trace(
+                    conversation_id=conversation_id,
+                    message=message,
+                    analysis=analysis,
+                    keywords=keywords,
+                    source_event_ids=source_event_ids,
+                )
+                action = "created"
+
+            report[action] += 1
+            report["trace_ids"].append(trace["id"])
+            report["details"].append(
+                {
+                    "message_id": message_id,
+                    "action": action,
+                    "trace_id": trace["id"],
+                    "memory_type": trace["candidate_memory_type"],
+                    "capture_score": trace["capture_score"],
+                    "reasons": trace["extraction_reasons"],
+                }
+            )
+            history.append(message)
+        return report
+
+    @staticmethod
+    def _record_capture_skip(report: dict[str, Any], message_id: str, reason: str) -> None:
+        report["skipped"] += 1
+        report["details"].append({"message_id": message_id, "action": "skipped", "reason": reason})
+
+    def repetition_score(
+        self,
+        content: str,
+        keywords: list[str],
+        history: list[dict[str, Any]],
+        current_message_id: str,
+    ) -> float:
+        fingerprint = content_fingerprint(content)
+        matches: list[float] = []
+        for previous in reversed(history[-400:]):
+            if previous.get("role") != "user" or str(previous.get("id")) == current_message_id:
+                continue
+            previous_content = str(previous.get("content") or "")
+            if not previous_content.strip():
+                continue
+            if content_fingerprint(previous_content) == fingerprint:
+                matches.append(1.0)
+            else:
+                similarity = term_similarity(keywords, query_terms(previous_content))
+                if similarity >= 0.65:
+                    matches.append(similarity)
+            if len(matches) >= 5:
+                break
+        if not matches:
+            return 0.0
+        return clamp(0.50 + 0.20 * max(matches) + 0.08 * min(3, len(matches)))
+
+    def find_reinforceable_trace(
+        self,
+        fingerprint: str,
+        keywords: list[str],
+        candidate_memory_type: str,
+    ) -> dict[str, Any] | None:
+        best: tuple[float, dict[str, Any]] | None = None
+        for trace in self.layered.list_traces(include_archived=False, limit=500):
+            if trace.get("status") not in {"active", "review"}:
+                continue
+            if trace.get("candidate_memory_type") != candidate_memory_type:
+                continue
+            if fingerprint and trace.get("content_fingerprint") == fingerprint:
+                score = 1.0
+            else:
+                score = term_similarity(keywords, trace.get("keywords") or [])
+            if score >= 0.88 and (best is None or score > best[0]):
+                best = (score, trace)
+        return best[1] if best else None
+
+    def create_automatic_trace(
+        self,
+        conversation_id: str,
+        message: dict[str, Any],
+        analysis: dict[str, Any],
+        keywords: list[str],
+        source_event_ids: list[str],
+    ) -> dict[str, Any]:
+        capture_score = float(analysis["capture_score"])
+        repetition_score = float(analysis.get("repetition_score", 0.0))
+        affect = dict(analysis.get("affect_signal") or {})
+        salience = max(capture_score, float(affect.get("intensity", 0.0)))
+        reasons = list(analysis.get("reasons") or [])
+        temporal_hint = dict(analysis.get("temporal_hint") or {})
+        return self.create_memory_trace(
+            {
+                "conversation_id": conversation_id,
+                "turn_id": message["id"],
+                "trace_stage": "candidate",
+                "candidate_memory_type": analysis["candidate_memory_type"],
+                "title": str(analysis["summary"])[:80],
+                "content": analysis["summary"],
+                "keywords": keywords,
+                "acquisition_mode": "automatic",
+                "epistemic_status": "inferred",
+                "epistemic_confidence": clamp(0.42 + 0.25 * capture_score),
+                "activation": clamp(0.42 + 0.35 * capture_score),
+                "salience": salience,
+                "stability": clamp(0.10 + 0.16 * repetition_score),
+                "continuity_score": repetition_score,
+                "affect_signal": affect,
+                "capture_score": capture_score,
+                "repetition_score": repetition_score,
+                "unfinished_score": analysis.get("unfinished_score", 0.0),
+                "confirmation_score": analysis.get("confirmation_score", 0.0),
+                "occurrence_count": 1,
+                "extraction_reasons": reasons,
+                "content_fingerprint": analysis["fingerprint"],
+                "observed_at": message["created_at"],
+                "event_time": message["event_time"],
+                "received_at": message["received_at"],
+                "persisted_at": message["persisted_at"],
+                "source_time": message["source_time"],
+                "timezone": message["timezone"],
+                "time_source": message["time_source"],
+                "valid_from": message.get("valid_from") or temporal_hint.get("valid_from"),
+                "valid_until": message.get("valid_until") or temporal_hint.get("valid_until"),
+                "evidence_summary": "Automatic candidate extraction; signals: " + ", ".join(reasons),
+                "source_event_ids": source_event_ids,
+                "source": {
+                    "conversation_id": conversation_id,
+                    "message_id": message["id"],
+                    "actor_id": message.get("actor_id"),
+                    "actor_role": message.get("actor_role") or "user",
+                    "source_channel": message.get("source_channel") or "api",
+                    "content_origin": "summary",
+                    "extractor": "deterministic_phase2_v1",
+                    "temporal_extractor": "deterministic_phase3_v1" if temporal_hint else None,
+                    "temporal_expression": temporal_hint.get("temporal_expression"),
+                    "temporal_precision": temporal_hint.get("temporal_precision"),
+                },
+                "actor_id": message.get("actor_id"),
+                "actor_role": "system",
+                "source_channel": "automatic_capture",
+                "content_origin": "summary",
+                "extractor": "deterministic_phase2_v1",
+                "derived_from": [
+                    {
+                        "object_type": "raw_message",
+                        "object_id": source_event_id,
+                        "relation": "summarized_from",
                     }
-                    self.upsert_persistent(item, con=con, overwrite=True)
-                    persistent.append(item["id"])
-        return {"raw_messages": created, "persistent_memories": persistent}
+                    for source_event_id in source_event_ids
+                ],
+            }
+        )
+
+    def reinforce_automatic_trace(
+        self,
+        trace: dict[str, Any],
+        analysis: dict[str, Any],
+        source_event_ids: list[str],
+        observed_at: str,
+    ) -> dict[str, Any]:
+        existing_affect = dict(trace.get("affect_signal") or {})
+        incoming_affect = dict(analysis.get("affect_signal") or {})
+        affect = (
+            incoming_affect
+            if float(incoming_affect.get("intensity", 0.0)) > float(existing_affect.get("intensity", 0.0))
+            else existing_affect
+        )
+        reasons = unique_list(trace.get("extraction_reasons") or [], analysis.get("reasons") or [], ["repetition"])
+        repetition = max(float(trace.get("repetition_score", 0.0)), float(analysis.get("repetition_score", 0.0)), 0.62)
+        return self.patch_memory_trace(
+            trace["id"],
+            {
+                "activation": clamp(float(trace["activation"]) + 0.14 * (1.0 - float(trace["activation"]))),
+                "salience": max(float(trace["salience"]), float(analysis["capture_score"]), float(affect.get("intensity", 0.0))),
+                "stability": clamp(float(trace["stability"]) + 0.08 * (1.0 - float(trace["stability"]))),
+                "continuity_score": clamp(max(float(trace["continuity_score"]), repetition) + 0.05),
+                "affect_signal": affect,
+                "capture_score": max(float(trace.get("capture_score", 0.0)), float(analysis["capture_score"])),
+                "repetition_score": repetition,
+                "unfinished_score": max(float(trace.get("unfinished_score", 0.0)), float(analysis.get("unfinished_score", 0.0))),
+                "confirmation_score": max(float(trace.get("confirmation_score", 0.0)), float(analysis.get("confirmation_score", 0.0))),
+                "occurrence_count": int(trace.get("occurrence_count", 1)) + 1,
+                "extraction_reasons": reasons,
+                "last_observed_at": observed_at,
+                "source_event_ids": unique_list(trace.get("source_event_ids") or [], source_event_ids),
+                "evidence_summary": "Automatic candidate reinforced; signals: " + ", ".join(reasons),
+            },
+        )
 
     def load_openwebui_chat(
         self,
@@ -689,6 +1264,10 @@ class MemoryManager:
                     "id": f"openwebui_{message_id}",
                     "role": item.get("role", "user"),
                     "content": str(content),
+                    "event_time": from_unix(item.get("timestamp") or row["created_at"]),
+                    "source_time": from_unix(item.get("timestamp") or row["created_at"]),
+                    "timezone": "UTC",
+                    "time_source": "openwebui_history",
                     "created_at": from_unix(item.get("timestamp") or row["created_at"]),
                     "meta": {
                         "source": "openwebui",
@@ -739,7 +1318,12 @@ class MemoryManager:
     ) -> dict[str, Any]:
         chat = self.load_openwebui_chat(chat_id, webui_db_path=webui_db_path, branch=branch)
         conversation_id = f"openwebui:{chat_id}:{branch}"
-        ingest = self.ingest_messages(conversation_id, chat["messages"])
+        ingest = self.ingest_messages(
+            conversation_id,
+            chat["messages"],
+            auto_capture=False,
+            default_timezone="UTC",
+        )
         created: dict[str, list[str]] = {"daily_summaries": [], "episodic_memories": [], "project_memories": []}
         warnings: list[str] = []
         if create_memories:
@@ -1151,13 +1735,18 @@ class MemoryManager:
         include_archived: bool = False,
         memory_types: list[str] | None = None,
         update_recall: bool = True,
+        temporal_scope: str = "auto",
+        as_of: str | None = None,
     ) -> list[RetrievalResult]:
+        scope = temporal_scope_for_query(query, temporal_scope)
         results = self.layered.retrieve(
             query=query,
             limit=limit,
             include_archived=include_archived,
             memory_types=memory_types,
             update_recall=update_recall,
+            temporal_scope=scope,
+            as_of=as_of,
         )
         return [
             RetrievalResult(
@@ -1178,8 +1767,19 @@ class MemoryManager:
         include_recent_raw: bool = False,
         conversation_id: str | None = None,
         char_budget: int = 3500,
+        timezone: str | None = None,
+        as_of: str | None = None,
+        temporal_scope: str = "auto",
     ) -> dict[str, Any]:
-        retrieved = self.retrieve(query, limit=limit)
+        zone = timezone_name(timezone or self.default_timezone)
+        reference = normalize_timestamp(as_of or utc_now(), zone, field_name="as_of")
+        scope = temporal_scope_for_query(query, temporal_scope)
+        retrieved = self.retrieve(
+            query,
+            limit=limit,
+            temporal_scope=scope,
+            as_of=reference,
+        )
         stable = [
             r
             for r in retrieved
@@ -1212,25 +1812,136 @@ class MemoryManager:
             if raw:
                 sections.append("[Recent raw turns]\n" + "\n".join(f"- {m['role']}: {m['content']}" for m in raw))
 
-        memory_context = self.build_memory_context_block(retrieved, char_budget=char_budget)
+        temporal = self.build_temporal_context(
+            conversation_id=conversation_id,
+            timezone=zone,
+            as_of=reference,
+        )
+        attribution_evidence = self.build_attribution_evidence(retrieved)
+        memory_context = self.build_memory_context_block(
+            retrieved,
+            char_budget=char_budget,
+            temporal=temporal,
+            attribution_evidence=attribution_evidence,
+        )
         return {
             "context": "\n\n".join(sections),
             "memory_context": memory_context,
+            "temporal_context": temporal,
+            "attribution_evidence": attribution_evidence,
             "injection": {
                 "recommended_role": "system",
                 "placement": "after base system/persona instructions and before recent raw turns",
                 "estimated_chars": len(memory_context),
                 "char_budget": char_budget,
                 "result_count": len(retrieved),
+                "temporal_scope": scope,
+                "as_of": reference,
+                "timezone": zone,
                 "policy": "Use confirmed memories as stable context. Treat inferred memories as tentative hints, never as certain facts.",
             },
             "retrieved": [self.result_to_dict(r) for r in retrieved],
             "policy": "Memories are inserted as compact, source-aware context. Inferred memories should be treated as tentative, not as certain facts.",
         }
 
-    def build_memory_context_block(self, retrieved: list[RetrievalResult], char_budget: int = 3500) -> str:
-        if not retrieved:
-            return ""
+    def build_temporal_context(
+        self,
+        conversation_id: str | None = None,
+        timezone: str | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, Any]:
+        zone = timezone_name(timezone or self.default_timezone)
+        reference = normalize_timestamp(as_of or utc_now(), zone, field_name="as_of")
+        latest: dict[str, Any] | None = None
+        previous: dict[str, Any] | None = None
+        latest_ingested: dict[str, Any] | None = None
+        started_at: str | None = None
+        event_count = 0
+        if conversation_id:
+            with self.connect() as con:
+                rows = con.execute(
+                    """
+                    SELECT id, role, event_time, received_at, persisted_at, source_time,
+                           timezone, time_source, event_sequence, ingest_delay_seconds
+                    FROM raw_messages
+                    WHERE conversation_id=? AND event_time<=?
+                    ORDER BY event_time DESC, event_sequence DESC
+                    LIMIT 2
+                    """,
+                    (conversation_id, reference),
+                ).fetchall()
+                if rows:
+                    latest = dict(rows[0])
+                if len(rows) > 1:
+                    previous = dict(rows[1])
+                ingested_row = con.execute(
+                    """
+                    SELECT id, role, event_time, received_at, persisted_at, source_time,
+                           timezone, time_source, event_sequence, ingest_delay_seconds
+                    FROM raw_messages
+                    WHERE conversation_id=?
+                    ORDER BY event_sequence DESC
+                    LIMIT 1
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                if ingested_row:
+                    latest_ingested = dict(ingested_row)
+                first = con.execute(
+                    "SELECT MIN(event_time), count(*) FROM raw_messages WHERE conversation_id=? AND event_time<=?",
+                    (conversation_id, reference),
+                ).fetchone()
+                started_at = first[0]
+                event_count = int(first[1])
+
+        elapsed_since_latest = seconds_between(reference, latest.get("event_time") if latest else None)
+        gap_before_latest = seconds_between(
+            latest.get("event_time") if latest else None,
+            previous.get("event_time") if previous else None,
+        )
+        local_now = local_timestamp(reference, zone)
+        lines = [
+            "<temporal_context>",
+            f"current_time={local_now}",
+            f"current_time_utc={reference}",
+            f"timezone={zone}",
+        ]
+        if latest:
+            lines.extend(
+                [
+                    f"latest_event_time={local_timestamp(latest['event_time'], zone)}",
+                    f"elapsed_since_latest={duration_text(elapsed_since_latest)}",
+                ]
+            )
+        if previous:
+            lines.append(f"gap_before_latest={duration_text(gap_before_latest)}")
+        lines.append("event_time is when an event occurred; received_at is when it entered memory.")
+        lines.append("Do not treat an imported historical event as if it happened at ingestion time.")
+        lines.append("</temporal_context>")
+        return {
+            "text": "\n".join(lines),
+            "timezone": zone,
+            "current_time": local_now,
+            "current_time_utc": reference,
+            "conversation_id": conversation_id,
+            "conversation_started_at": local_timestamp(started_at, zone) if started_at else None,
+            "event_count": event_count,
+            "latest_event": latest,
+            "previous_event": previous,
+            "latest_ingested_event": latest_ingested,
+            "elapsed_since_latest_seconds": elapsed_since_latest,
+            "elapsed_since_latest": duration_text(elapsed_since_latest),
+            "gap_before_latest_seconds": gap_before_latest,
+            "gap_before_latest": duration_text(gap_before_latest),
+        }
+
+    def build_memory_context_block(
+        self,
+        retrieved: list[RetrievalResult],
+        char_budget: int = 3500,
+        temporal: dict[str, Any] | None = None,
+        attribution_evidence: dict[str, Any] | None = None,
+    ) -> str:
 
         confirmed_keys = {
             (r.memory_type, r.memory.get("id"))
@@ -1258,34 +1969,45 @@ class MemoryManager:
 
         lines = [
             "<memory_context>",
-            "Use these retrieved memories only when relevant to the user's current request.",
-            "Confirmed memories may be treated as stable user-provided context.",
-            "Inferred memories are tentative: do not present them as certain facts, and avoid over-personalizing from them.",
         ]
+        if temporal and temporal.get("text"):
+            lines.extend([str(temporal["text"]), ""])
+        if retrieved:
+            lines.extend(
+                [
+                    "Use these retrieved memories only when relevant to the user's current request.",
+                    "Confirmed memories may be treated as stable user-provided context.",
+                    "Inferred memories are tentative: do not present them as certain facts, and avoid over-personalizing from them.",
+                    "When attributing past speech, requests, preferences, beliefs, or proposals, preserve the recorded actor.",
+                    "Attach [[event:ID]] or [[memory:ID]] immediately after an attribution claim; the marker is validated and removed before display.",
+                ]
+            )
+
+        evidence_by_memory = (attribution_evidence or {}).get("by_memory", {})
 
         if groups["confirmed"]:
             lines.append("")
             lines.append("[confirmed_memory]")
             for result in groups["confirmed"][:4]:
-                lines.append(self.memory_context_line(result))
+                lines.append(self.memory_context_line(result, evidence_by_memory))
 
         if groups["project"]:
             lines.append("")
             lines.append("[active_project_memory]")
             for result in groups["project"][:4]:
-                lines.append(self.memory_context_line(result))
+                lines.append(self.memory_context_line(result, evidence_by_memory))
 
         if groups["episodic"]:
             lines.append("")
             lines.append("[retrieved_episodic_memory]")
             for result in groups["episodic"][:5]:
-                lines.append(self.memory_context_line(result))
+                lines.append(self.memory_context_line(result, evidence_by_memory))
 
         if groups["tentative"]:
             lines.append("")
             lines.append("[other_tentative_memory]")
             for result in groups["tentative"][:3]:
-                lines.append(self.memory_context_line(result))
+                lines.append(self.memory_context_line(result, evidence_by_memory))
 
         lines.append("</memory_context>")
         block = "\n".join(lines)
@@ -1293,7 +2015,100 @@ class MemoryManager:
             return block
         return block[: char_budget - 64].rstrip() + "\n...memory_context truncated...\n</memory_context>"
 
-    def memory_context_line(self, result: RetrievalResult) -> str:
+    def build_attribution_evidence(
+        self, retrieved: list[RetrievalResult]
+    ) -> dict[str, Any]:
+        memory_ids = [
+            str(result.memory.get("id"))
+            for result in retrieved
+            if result.memory.get("id")
+        ]
+        event_ids: list[str] = []
+        by_memory: dict[str, list[dict[str, str]]] = {}
+        for result in retrieved:
+            memory = result.memory
+            memory_id = str(memory.get("id") or "")
+            sources = list(memory.get("source_event_ids") or [])
+            for derivation in memory.get("derived_from") or []:
+                if (
+                    isinstance(derivation, dict)
+                    and derivation.get("object_type") == "raw_message"
+                    and derivation.get("object_id")
+                ):
+                    sources.append(str(derivation["object_id"]))
+            event_ids.extend(str(item) for item in sources if item)
+            by_memory[memory_id] = []
+
+        event_ids = list(dict.fromkeys(event_ids))[:200]
+        with self.connect() as con:
+            raw_rows = (
+                con.execute(
+                    f"SELECT id, actor_role, role, content_origin, source_channel FROM raw_messages WHERE id IN ({','.join('?' for _ in event_ids)})",
+                    event_ids,
+                ).fetchall()
+                if event_ids
+                else []
+            )
+        raw_map = {str(row["id"]): dict(row) for row in raw_rows}
+        records: list[dict[str, str]] = []
+        for event_id in event_ids:
+            row = raw_map.get(event_id)
+            if not row:
+                continue
+            record = {
+                "reference_type": "event",
+                "reference_id": event_id,
+                "actor_role": str(row.get("actor_role") or row.get("role") or "unknown"),
+                "content_origin": str(row.get("content_origin") or "unknown"),
+                "source_channel": str(row.get("source_channel") or "unknown"),
+            }
+            records.append(record)
+        for result in retrieved:
+            memory = result.memory
+            memory_id = str(memory.get("id") or "")
+            source_ids = list(memory.get("source_event_ids") or [])
+            for derivation in memory.get("derived_from") or []:
+                if isinstance(derivation, dict) and derivation.get("object_type") == "raw_message":
+                    source_ids.append(str(derivation.get("object_id") or ""))
+            refs = [
+                {
+                    "reference_type": "event",
+                    "reference_id": source_id,
+                    "actor_role": str(
+                        raw_map[source_id].get("actor_role")
+                        or raw_map[source_id].get("role")
+                        or "unknown"
+                    ),
+                    "content_origin": str(raw_map[source_id].get("content_origin") or "unknown"),
+                }
+                for source_id in dict.fromkeys(source_ids)
+                if source_id in raw_map
+            ]
+            refs.append(
+                {
+                    "reference_type": "memory",
+                    "reference_id": memory_id,
+                    "actor_role": str(memory.get("actor_role") or "unknown"),
+                    "content_origin": str(memory.get("content_origin") or "unknown"),
+                }
+            )
+            by_memory[memory_id] = refs
+        return {
+            "event_ids": [record["reference_id"] for record in records],
+            "memory_ids": memory_ids,
+            "records": records,
+            "by_memory": by_memory,
+            "citation_syntax": {
+                "event": "[[event:ID]]",
+                "memory": "[[memory:ID]]",
+            },
+        }
+
+    def memory_context_line(
+        self,
+        result: RetrievalResult,
+        evidence_by_memory: dict[str, list[dict[str, str]]] | None = None,
+    ) -> str:
         memory = result.memory
         title = memory.get("title", memory.get("id", "memory"))
         body = memory.get("content") or memory.get("summary", "")
@@ -1313,10 +2128,35 @@ class MemoryManager:
             flags.append("user_confirmed")
         if memory.get("source", {}).get("llm_suggested_pinned"):
             flags.append("llm_suggested_pinned")
+        temporal_status = memory.get("temporal_status") or temporal_state(memory)
+        if temporal_status != "current":
+            flags.append(temporal_status)
+        validity = []
+        if memory.get("valid_from"):
+            validity.append(f"valid_from={memory['valid_from']}")
+        if memory.get("valid_until"):
+            validity.append(f"valid_until={memory['valid_until']}")
+        validity_text = f"; {'; '.join(validity)}" if validity else ""
         flag_text = f"; flags={','.join(flags)}" if flags else ""
+        attribution = (
+            f"; actor={memory.get('actor_role') or 'unknown'}"
+            f"; origin={memory.get('content_origin') or 'unknown'}"
+            f"; channel={memory.get('source_channel') or 'unknown'}"
+        )
+        references = (evidence_by_memory or {}).get(str(memory.get("id") or ""), [])
+        reference_text = ",".join(
+            (
+                f"event:{item['reference_id']}@{item['actor_role']}"
+                if item["reference_type"] == "event"
+                else f"memory:{item['reference_id']}@{item['actor_role']}"
+            )
+            for item in references[:6]
+        )
+        source_text = f"; sources={reference_text}" if reference_text else ""
         return (
             f"- ({result.memory_type}; evidence={evidence}; confidence={confidence:.2f}; "
-            f"relevance={relevance:.2f}; inject={result.inject_mode}{flag_text}) "
+            f"relevance={relevance:.2f}; inject={result.inject_mode}{attribution}"
+            f"{source_text}{flag_text}{validity_text}) "
             f"{title}: {body}"
         )
 
@@ -1360,10 +2200,14 @@ class MemoryManager:
         with self.connect() as con:
             rows = con.execute(
                 """
-                SELECT id, conversation_id, role, content, created_at, meta_json
+                SELECT id, conversation_id, role, content, event_time, received_at,
+                       persisted_at, source_time, timezone, time_source,
+                       event_sequence, ingest_delay_seconds, actor_id, actor_role,
+                       source_channel, content_origin, extractor, derived_from_json,
+                       latest_audit_event_id, latest_object_digest, created_at, meta_json
                 FROM raw_messages
                 WHERE conversation_id=?
-                ORDER BY created_at DESC
+                ORDER BY event_sequence DESC, event_time DESC
                 LIMIT ?
                 """,
                 (conversation_id, limit),
@@ -1374,8 +2218,24 @@ class MemoryManager:
                 "conversation_id": row["conversation_id"],
                 "role": row["role"],
                 "content": row["content"],
+                "event_time": row["event_time"],
+                "received_at": row["received_at"],
+                "persisted_at": row["persisted_at"],
+                "source_time": row["source_time"],
+                "timezone": row["timezone"],
+                "time_source": row["time_source"],
+                "event_sequence": row["event_sequence"],
+                "ingest_delay_seconds": row["ingest_delay_seconds"],
                 "created_at": row["created_at"],
                 "meta": loads(row["meta_json"], {}),
+                "actor_id": row["actor_id"],
+                "actor_role": row["actor_role"],
+                "source_channel": row["source_channel"],
+                "content_origin": row["content_origin"],
+                "extractor": row["extractor"],
+                "derived_from": loads(row["derived_from_json"], []),
+                "latest_audit_event_id": row["latest_audit_event_id"],
+                "latest_object_digest": row["latest_object_digest"],
             }
             for row in reversed(rows)
         ]
@@ -1816,12 +2676,16 @@ class MemoryManager:
         epistemic_status: str | None = None,
         include_archived: bool = False,
         limit: int = 200,
+        temporal_scope: str = "current",
+        as_of: str | None = None,
     ) -> list[dict[str, Any]]:
         return self.layered.list_memories(
             memory_type=memory_type,
             epistemic_status=epistemic_status,
             include_archived=include_archived,
             limit=limit,
+            temporal_scope=temporal_scope,
+            as_of=as_of,
         )
 
     def get_long_term_memory(self, memory_id: str) -> dict[str, Any]:
@@ -1854,6 +2718,21 @@ class MemoryManager:
             if legacy_patch:
                 self.patch_memory(legacy_type, legacy_id, legacy_patch)
                 updated = self.layered.get_memory(memory_id)
+                temporal_keys = {
+                    "event_time",
+                    "received_at",
+                    "persisted_at",
+                    "source_time",
+                    "timezone",
+                    "time_source",
+                    "valid_from",
+                    "valid_until",
+                    "superseded_by",
+                    "expires_at",
+                }
+                temporal_patch = {key: value for key, value in patch.items() if key in temporal_keys}
+                if temporal_patch:
+                    updated = self.layered.patch_memory(memory_id, temporal_patch)
         return updated
 
     def forget_long_term_memory(self, memory_id: str) -> None:
@@ -1865,11 +2744,24 @@ class MemoryManager:
         else:
             self.layered.forget_memory(memory_id)
 
+    def supersede_long_term_memory(
+        self,
+        memory_id: str,
+        replacement_memory_id: str,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        return self.layered.supersede_memory(
+            memory_id,
+            replacement_memory_id,
+            effective_at=effective_at,
+        )
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as con:
             stats = {
                 "db_path": str(self.db_path),
                 "lmstudio_base_url": self.lmstudio_base_url,
+                "default_timezone": self.default_timezone,
                 "raw_messages": con.execute("SELECT count(*) FROM raw_messages").fetchone()[0],
                 "daily_summaries": con.execute("SELECT count(*) FROM daily_summaries").fetchone()[0],
                 "episodic_memories": con.execute("SELECT count(*) FROM episodic_memories").fetchone()[0],
@@ -1879,3 +2771,123 @@ class MemoryManager:
             }
         stats.update(self.layered.stats())
         return stats
+
+    def phase1_status(self) -> dict[str, Any]:
+        return self.layered.phase1_status()
+
+    def phase2_status(self) -> dict[str, Any]:
+        return self.layered.phase2_status()
+
+    def phase3_status(self) -> dict[str, Any]:
+        return self.layered.phase3_status()
+
+    def phase4_status(self) -> dict[str, Any]:
+        return self.layered.phase4_status()
+
+    def phase5_status(self) -> dict[str, Any]:
+        return self.layered.phase5_status()
+
+    def create_signed_checkpoint(self, reason: str = "manual") -> dict[str, Any]:
+        return self.layered.create_signed_checkpoint(reason=reason)
+
+    def verify_checkpoints(self) -> dict[str, Any]:
+        return self.layered.verify_checkpoints()
+
+    def list_checkpoints(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.layered.list_checkpoints(limit=limit)
+
+    def list_signing_keys(self) -> list[dict[str, Any]]:
+        return self.layered.list_signing_keys()
+
+    def rotate_signing_key(self) -> dict[str, Any]:
+        return self.layered.rotate_signing_key()
+
+    def list_audit_branches(self) -> list[dict[str, Any]]:
+        return self.layered.list_audit_branches()
+
+    def create_signed_backup(self, label: str | None = None) -> dict[str, Any]:
+        return self.layered.create_signed_backup(label=label)
+
+    def verify_signed_backup(self, filename: str) -> dict[str, Any]:
+        return self.layered.verify_signed_backup(filename)
+
+    def plan_backup_restore(self, filename: str) -> dict[str, Any]:
+        return self.layered.plan_backup_restore(filename)
+
+    def adopt_restore_branch(self, previous_anchor: dict[str, Any]) -> dict[str, Any]:
+        return self.layered.adopt_restore_branch(previous_anchor)
+
+    def validate_response_attribution(
+        self,
+        *,
+        content: str,
+        conversation_id: str | None = None,
+        event_ids: list[str] | None = None,
+        memory_ids: list[str] | None = None,
+        claims: list[dict[str, Any]] | None = None,
+        threshold: float = 0.46,
+    ) -> dict[str, Any]:
+        return self.layered.validate_response_attribution(
+            content=content,
+            conversation_id=conversation_id,
+            event_ids=event_ids,
+            memory_ids=memory_ids,
+            claims=claims,
+            threshold=threshold,
+        )
+
+    def select_response_candidate(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+        conversation_id: str | None = None,
+        event_ids: list[str] | None = None,
+        memory_ids: list[str] | None = None,
+        threshold: float = 0.46,
+    ) -> dict[str, Any]:
+        return self.layered.select_response_candidate(
+            candidates=candidates,
+            conversation_id=conversation_id,
+            event_ids=event_ids,
+            memory_ids=memory_ids,
+            threshold=threshold,
+        )
+
+    def attribution_gate_status(self) -> dict[str, Any]:
+        phase5 = self.phase5_status()
+        return {
+            "phase": "extra",
+            "name": "response attribution gate",
+            "complete": phase5["complete"],
+            "depends_on": {"phase4": self.phase4_status()["complete"], "phase5": phase5["complete"]},
+            "capabilities": {
+                "deterministic_claim_extraction": True,
+                "event_actor_verification": True,
+                "explicit_memory_verification": True,
+                "derived_source_rejection": True,
+                "unverified_classification": True,
+                "multi_candidate_selection": True,
+                "content_truth_evaluation": False,
+            },
+            "policy_scope": "speaker attribution only; answer truth and quality are intentionally out of scope",
+        }
+
+    def verify_audit(self, verify_objects: bool = True) -> dict[str, Any]:
+        return self.layered.verify_audit(verify_objects=verify_objects)
+
+    def list_audit_events(
+        self,
+        object_type: str | None = None,
+        object_id: str | None = None,
+        limit: int = 100,
+        include_payload: bool = False,
+    ) -> list[dict[str, Any]]:
+        return self.layered.list_audit_events(
+            object_type=object_type,
+            object_id=object_id,
+            limit=limit,
+            include_payload=include_payload,
+        )
+
+    def get_provenance(self, object_type: str, object_id: str) -> dict[str, Any]:
+        return self.layered.get_provenance(object_type, object_id)

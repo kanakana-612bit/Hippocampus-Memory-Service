@@ -37,6 +37,39 @@ class PublicImplementationStatusTests(unittest.TestCase):
         self.assertEqual(objects["memories"], "table")
         self.assertEqual(objects["long_term_memory_fts"], "table")
 
+    def test_phase1_state_survives_manager_restart(self) -> None:
+        explicit = self.manager.remember(
+            "A confirmed memory must survive a service restart.",
+            keywords=["restart-confirmed"],
+        )
+        trace = self.manager.create_memory_trace(
+            {
+                "content": "A short-term trace must survive a service restart.",
+                "candidate_memory_type": "episodic",
+                "keywords": ["restart-trace"],
+                "activation": 0.42,
+                "epistemic_confidence": 0.63,
+            }
+        )
+        recalled = self.manager.recall_memory_trace(trace["id"])
+
+        restarted = MemoryManager(self.db_path)
+        restored_explicit = restarted.get_long_term_memory(explicit["memory"]["id"])
+        restored_trace = restarted.get_memory_trace(trace["id"])
+
+        self.assertEqual(restored_explicit["epistemic_status"], "confirmed")
+        self.assertEqual(restored_explicit["content"], explicit["memory"]["content"])
+        self.assertEqual(restored_trace["recall_count"], recalled["recall_count"])
+        self.assertEqual(restored_trace["activation"], recalled["activation"])
+        self.assertEqual(restored_trace["epistemic_confidence"], 0.63)
+        self.assertTrue(restarted.phase1_status()["complete"])
+
+        explicit_results = restarted.retrieve("restart-confirmed", update_recall=False)
+        self.assertIn(
+            explicit["memory"]["id"],
+            {result.memory["id"] for result in explicit_results},
+        )
+
     def test_all_public_long_term_types_consolidate(self) -> None:
         for memory_type in ("episodic", "semantic", "prospective", "procedural"):
             with self.subTest(memory_type=memory_type):

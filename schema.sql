@@ -6,6 +6,22 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     conversation_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
+    event_time TEXT,
+    received_at TEXT,
+    persisted_at TEXT,
+    source_time TEXT,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    time_source TEXT NOT NULL DEFAULT 'ingest',
+    event_sequence INTEGER,
+    ingest_delay_seconds REAL NOT NULL DEFAULT 0.0,
+    actor_id TEXT,
+    actor_role TEXT NOT NULL DEFAULT 'unknown',
+    source_channel TEXT NOT NULL DEFAULT 'api',
+    content_origin TEXT NOT NULL DEFAULT 'original',
+    extractor TEXT,
+    derived_from_json TEXT NOT NULL DEFAULT '[]',
+    latest_audit_event_id TEXT,
+    latest_object_digest TEXT,
     created_at TEXT NOT NULL,
     meta_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -138,6 +154,33 @@ CREATE TABLE IF NOT EXISTS memory_traces (
     continuity_score REAL NOT NULL DEFAULT 0.0,
     retention_score REAL NOT NULL DEFAULT 0.0,
     affect_signal_json TEXT NOT NULL DEFAULT '{}',
+    capture_score REAL NOT NULL DEFAULT 0.0,
+    repetition_score REAL NOT NULL DEFAULT 0.0,
+    unfinished_score REAL NOT NULL DEFAULT 0.0,
+    confirmation_score REAL NOT NULL DEFAULT 0.0,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    extraction_reasons_json TEXT NOT NULL DEFAULT '[]',
+    content_fingerprint TEXT NOT NULL DEFAULT '',
+    first_observed_at TEXT,
+    last_observed_at TEXT,
+    event_time TEXT,
+    received_at TEXT,
+    persisted_at TEXT,
+    source_time TEXT,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    time_source TEXT NOT NULL DEFAULT 'ingest',
+    ingest_delay_seconds REAL NOT NULL DEFAULT 0.0,
+    valid_from TEXT,
+    valid_until TEXT,
+    superseded_by TEXT,
+    actor_id TEXT,
+    actor_role TEXT NOT NULL DEFAULT 'system',
+    source_channel TEXT NOT NULL DEFAULT 'internal',
+    content_origin TEXT NOT NULL DEFAULT 'derived',
+    extractor TEXT,
+    derived_from_json TEXT NOT NULL DEFAULT '[]',
+    latest_audit_event_id TEXT,
+    latest_object_digest TEXT,
     evidence_summary TEXT NOT NULL DEFAULT '',
     source_event_ids_json TEXT NOT NULL DEFAULT '[]',
     source_json TEXT NOT NULL DEFAULT '{}',
@@ -184,6 +227,24 @@ CREATE TABLE IF NOT EXISTS memories (
     recall_count INTEGER NOT NULL DEFAULT 0,
     last_decayed_at TEXT NOT NULL,
     expires_at TEXT,
+    event_time TEXT,
+    received_at TEXT,
+    persisted_at TEXT,
+    source_time TEXT,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    time_source TEXT NOT NULL DEFAULT 'derived',
+    ingest_delay_seconds REAL NOT NULL DEFAULT 0.0,
+    valid_from TEXT,
+    valid_until TEXT,
+    superseded_by TEXT,
+    actor_id TEXT,
+    actor_role TEXT NOT NULL DEFAULT 'system',
+    source_channel TEXT NOT NULL DEFAULT 'internal',
+    content_origin TEXT NOT NULL DEFAULT 'derived',
+    extractor TEXT,
+    derived_from_json TEXT NOT NULL DEFAULT '[]',
+    latest_audit_event_id TEXT,
+    latest_object_digest TEXT,
     pinned INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     evidence_summary TEXT NOT NULL DEFAULT '',
@@ -214,6 +275,191 @@ CREATE TABLE IF NOT EXISTS memory_evidence_links (
     FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
     FOREIGN KEY (trace_id) REFERENCES memory_traces(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    object_type TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    actor_id TEXT,
+    actor_role TEXT NOT NULL,
+    source_channel TEXT NOT NULL,
+    content_origin TEXT NOT NULL,
+    extractor TEXT,
+    derivation_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    object_digest TEXT,
+    previous_event_hash TEXT NOT NULL,
+    event_hash TEXT NOT NULL UNIQUE,
+    event_time TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    persisted_at TEXT NOT NULL,
+    integrity_tier TEXT NOT NULL DEFAULT 'routine'
+        CHECK (integrity_tier IN ('routine', 'durable', 'privileged')),
+    format_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provenance_edges (
+    edge_id TEXT PRIMARY KEY,
+    source_object_type TEXT NOT NULL,
+    source_object_id TEXT NOT NULL,
+    target_object_type TEXT NOT NULL,
+    target_object_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    audit_event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (
+        source_object_type, source_object_id,
+        target_object_type, target_object_id,
+        relation, audit_event_id
+    ),
+    FOREIGN KEY (audit_event_id) REFERENCES audit_events(event_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+BEFORE UPDATE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+BEFORE DELETE ON audit_events
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS provenance_edges_no_update
+BEFORE UPDATE ON provenance_edges
+BEGIN
+    SELECT RAISE(ABORT, 'provenance_edges is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS provenance_edges_no_delete
+BEFORE DELETE ON provenance_edges
+BEGIN
+    SELECT RAISE(ABORT, 'provenance_edges is append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS signing_keys (
+    key_id TEXT PRIMARY KEY,
+    algorithm TEXT NOT NULL,
+    public_key_b64 TEXT NOT NULL,
+    predecessor_key_id TEXT,
+    trust_origin TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS key_rotations (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    rotation_id TEXT NOT NULL UNIQUE,
+    old_key_id TEXT NOT NULL,
+    new_key_id TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    old_signature_b64 TEXT NOT NULL,
+    new_signature_b64 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_branches (
+    branch_id TEXT PRIMARY KEY,
+    parent_branch_id TEXT,
+    fork_checkpoint_id TEXT,
+    fork_checkpoint_hash TEXT,
+    previous_canonical_checkpoint_id TEXT,
+    previous_canonical_checkpoint_hash TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_branch_adoptions (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    adoption_id TEXT NOT NULL UNIQUE,
+    branch_id TEXT NOT NULL,
+    previous_branch_id TEXT,
+    reason TEXT NOT NULL,
+    adopted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_checkpoints (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    checkpoint_id TEXT NOT NULL UNIQUE,
+    branch_id TEXT NOT NULL,
+    sequence_end INTEGER NOT NULL,
+    head_event_id TEXT,
+    head_event_hash TEXT NOT NULL,
+    event_count INTEGER NOT NULL,
+    previous_checkpoint_id TEXT,
+    previous_checkpoint_hash TEXT,
+    key_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    signature_b64 TEXT NOT NULL,
+    checkpoint_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS signing_keys_no_update
+BEFORE UPDATE ON signing_keys
+BEGIN
+    SELECT RAISE(ABORT, 'signing_keys is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS signing_keys_no_delete
+BEFORE DELETE ON signing_keys
+BEGIN
+    SELECT RAISE(ABORT, 'signing_keys is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS key_rotations_no_update
+BEFORE UPDATE ON key_rotations
+BEGIN
+    SELECT RAISE(ABORT, 'key_rotations is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS key_rotations_no_delete
+BEFORE DELETE ON key_rotations
+BEGIN
+    SELECT RAISE(ABORT, 'key_rotations is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_branches_no_update
+BEFORE UPDATE ON audit_branches
+BEGIN
+    SELECT RAISE(ABORT, 'audit_branches is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_branches_no_delete
+BEFORE DELETE ON audit_branches
+BEGIN
+    SELECT RAISE(ABORT, 'audit_branches is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_branch_adoptions_no_update
+BEFORE UPDATE ON audit_branch_adoptions
+BEGIN
+    SELECT RAISE(ABORT, 'audit_branch_adoptions is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_branch_adoptions_no_delete
+BEFORE DELETE ON audit_branch_adoptions
+BEGIN
+    SELECT RAISE(ABORT, 'audit_branch_adoptions is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_checkpoints_no_update
+BEFORE UPDATE ON audit_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'audit_checkpoints is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_checkpoints_no_delete
+BEFORE DELETE ON audit_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'audit_checkpoints is append-only');
+END;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     memory_id UNINDEXED,
@@ -271,3 +517,30 @@ CREATE INDEX IF NOT EXISTS idx_memories_epistemic
 
 CREATE INDEX IF NOT EXISTS idx_memory_evidence_memory
     ON memory_evidence_links(memory_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_object
+    ON audit_events(object_type, object_id, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_hash
+    ON audit_events(previous_event_hash, event_hash);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_single_successor
+    ON audit_events(previous_event_hash);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_target
+    ON provenance_edges(target_object_type, target_object_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_source
+    ON provenance_edges(source_object_type, source_object_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_branch
+    ON audit_checkpoints(branch_id, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_head
+    ON audit_checkpoints(head_event_hash, sequence_end);
+
+CREATE INDEX IF NOT EXISTS idx_key_rotations_keys
+    ON key_rotations(old_key_id, new_key_id, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_branch_adoptions_branch
+    ON audit_branch_adoptions(branch_id, sequence);

@@ -48,6 +48,9 @@ FORBIDDEN_SUFFIXES = {
     ".mp4",
     ".ndjson",
     ".ogg",
+    ".p12",
+    ".pem",
+    ".pfx",
     ".png",
     ".sqlite",
     ".sqlite3",
@@ -56,6 +59,7 @@ FORBIDDEN_SUFFIXES = {
     ".webm",
     ".webp",
     ".zip",
+    ".key",
 }
 
 CONTENT_RULES = {

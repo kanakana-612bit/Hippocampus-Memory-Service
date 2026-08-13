@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import unittest
 import uuid
@@ -25,6 +26,7 @@ class LayeredMemoryApiTests(unittest.TestCase):
         import app as app_module
 
         cls.client = TestClient(app_module.app)
+        cls.security_dir = app_module.manager.layered.security.security_dir
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -37,6 +39,7 @@ class LayeredMemoryApiTests(unittest.TestCase):
             path = Path(f"{cls.db_path}{suffix}")
             if path.exists():
                 path.unlink()
+        shutil.rmtree(cls.security_dir, ignore_errors=True)
 
     def test_trace_lifecycle_over_http(self) -> None:
         created = self.client.post(
@@ -77,6 +80,287 @@ class LayeredMemoryApiTests(unittest.TestCase):
         self.assertEqual(retrieved.status_code, 200, retrieved.text)
         ids = [item["memory"]["id"] for item in retrieved.json()["retrieved"]]
         self.assertIn(memory["id"], ids)
+
+    def test_phase1_status_is_complete(self) -> None:
+        response = self.client.get("/status/phase1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["phase"], 1)
+        self.assertTrue(body["complete"])
+        self.assertEqual(body["missing_objects"], [])
+        self.assertTrue(all(body["capabilities"].values()))
+
+    def test_phase2_ingest_and_status(self) -> None:
+        status = self.client.get("/status/phase2")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["complete"])
+
+        response = self.client.post(
+            "/memory/ingest",
+            json={
+                "conversation_id": "api-phase2-conversation",
+                "messages": [
+                    {
+                        "id": "api-phase2-message",
+                        "role": "user",
+                        "content": "本当に素晴らしい。とても感動した！",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["automatic_capture"]["created"], 1)
+        self.assertEqual(len(body["memory_traces"]), 1)
+
+        trace = self.client.get(f"/memory/traces/{body['memory_traces'][0]}")
+        self.assertEqual(trace.status_code, 200, trace.text)
+        self.assertEqual(trace.json()["epistemic_status"], "inferred")
+
+    def test_phase3_status_and_temporal_context(self) -> None:
+        status = self.client.get("/status/phase3")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["complete"])
+
+        ingested = self.client.post(
+            "/memory/ingest",
+            json={
+                "conversation_id": "api-temporal-conversation",
+                "default_timezone": "Asia/Tokyo",
+                "auto_capture": False,
+                "messages": [
+                    {
+                        "id": "api-temporal-message",
+                        "role": "user",
+                        "content": "Historical event",
+                        "event_time": "2026-08-01T09:00:00",
+                        "timezone": "Asia/Tokyo",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(ingested.status_code, 200, ingested.text)
+
+        temporal = self.client.get(
+            "/temporal/context",
+            params={
+                "conversation_id": "api-temporal-conversation",
+                "timezone": "Asia/Tokyo",
+                "as_of": "2026-08-02T00:00:00Z",
+            },
+        )
+        self.assertEqual(temporal.status_code, 200, temporal.text)
+        self.assertEqual(temporal.json()["latest_event"]["event_time"], "2026-08-01T00:00:00.000+00:00")
+
+    def test_phase4_status_verification_and_provenance_api(self) -> None:
+        ingested = self.client.post(
+            "/memory/ingest",
+            json={
+                "conversation_id": "api-audit-conversation",
+                "auto_capture": False,
+                "messages": [
+                    {
+                        "id": "api-audit-source",
+                        "role": "user",
+                        "content": "Auditable source statement",
+                        "actor_id": "api-user",
+                        "actor_role": "user",
+                        "source_channel": "api-test",
+                        "content_origin": "original",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(ingested.status_code, 200, ingested.text)
+
+        status = self.client.get("/status/phase4")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["complete"])
+        self.assertFalse(status.json()["capabilities"]["signed_checkpoints"])
+
+        verification = self.client.get("/audit/verify")
+        self.assertEqual(verification.status_code, 200, verification.text)
+        self.assertTrue(verification.json()["valid"])
+
+        provenance = self.client.get("/provenance/raw_message/api-audit-source")
+        self.assertEqual(provenance.status_code, 200, provenance.text)
+        events = provenance.json()["events"]
+        self.assertEqual(events[0]["actor_id"], "api-user")
+        self.assertEqual(events[0]["actor_role"], "user")
+        self.assertEqual(events[0]["source_channel"], "api-test")
+
+        listed = self.client.get(
+            "/audit/events",
+            params={"object_type": "raw_message", "object_id": "api-audit-source"},
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(len(listed.json()["events"]), 1)
+
+    def test_phase5_checkpoint_key_branch_and_backup_api(self) -> None:
+        status = self.client.get("/status/phase5")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["complete"])
+
+        checkpoint = self.client.post(
+            "/audit/checkpoints", json={"reason": "api_test"}
+        )
+        self.assertEqual(checkpoint.status_code, 200, checkpoint.text)
+        self.assertTrue(checkpoint.json()["anchor"]["valid"])
+
+        verification = self.client.get("/audit/checkpoints/verify")
+        self.assertEqual(verification.status_code, 200, verification.text)
+        self.assertTrue(verification.json()["valid"])
+        self.assertEqual(verification.json()["uncheckpointed_event_count"], 0)
+
+        keys = self.client.get("/audit/keys")
+        branches = self.client.get("/audit/branches")
+        self.assertEqual(len(keys.json()["keys"]), 1)
+        self.assertEqual(len(branches.json()["branches"]), 1)
+
+        backup = self.client.post("/backups", json={"label": "api-test"})
+        self.assertEqual(backup.status_code, 200, backup.text)
+        filename = backup.json()["filename"]
+        checked = self.client.post("/backups/verify", json={"filename": filename})
+        planned = self.client.post("/restores/plan", json={"filename": filename})
+        self.assertTrue(checked.json()["valid"])
+        self.assertTrue(planned.json()["valid"])
+        self.assertEqual(planned.json()["relation"], "same_checkpoint")
+
+    def test_attribution_gate_validation_and_candidate_selection_api(self) -> None:
+        ingested = self.client.post(
+            "/memory/ingest",
+            json={
+                "conversation_id": "api-attribution-example",
+                "auto_capture": False,
+                "messages": [
+                    {
+                        "id": "api-attribution-user",
+                        "role": "user",
+                        "content": "A supports interpretation B.",
+                        "actor_role": "user",
+                    },
+                    {
+                        "id": "api-attribution-assistant",
+                        "role": "assistant",
+                        "content": "A may also support interpretation C.",
+                        "actor_role": "assistant",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(ingested.status_code, 200, ingested.text)
+
+        rejected = self.client.post(
+            "/attribution/validate",
+            json={
+                "content": '君が以前述べた「A may also support interpretation C.」は興味深い。',
+                "conversation_id": "api-attribution-example",
+            },
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(rejected.json()["decision"], "reject")
+
+        selected = self.client.post(
+            "/response/candidates/select",
+            json={
+                "conversation_id": "api-attribution-example",
+                "candidates": [
+                    {
+                        "candidate_id": "wrong",
+                        "content": 'You said "A may also support interpretation C."',
+                    },
+                    {
+                        "candidate_id": "right",
+                        "content": (
+                            'I said "A may also support interpretation C."'
+                            "[[event:api-attribution-assistant]]"
+                        ),
+                    },
+                ],
+            },
+        )
+        self.assertEqual(selected.status_code, 200, selected.text)
+        self.assertEqual(selected.json()["selected_candidate_id"], "right")
+        self.assertNotIn("[[event:", selected.json()["selected_content"])
+
+        status = self.client.get("/status/attribution-gate")
+        self.assertTrue(status.json()["complete"])
+
+    def test_invalid_phase3_timestamp_returns_400(self) -> None:
+        response = self.client.post(
+            "/memory/ingest",
+            json={
+                "conversation_id": "invalid-temporal-input",
+                "messages": [{"role": "user", "content": "test", "event_time": "not-a-time"}],
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+    def test_phase3_supersession_route_preserves_history(self) -> None:
+        original = self.client.post(
+            "/memory/remember",
+            json={
+                "content": "The preferred editor is Alpha.",
+                "keywords": ["preferred editor"],
+                "dedupe": False,
+                "event_time": "2026-08-01T00:00:00Z",
+                "valid_from": "2026-08-01T00:00:00Z",
+            },
+        )
+        replacement = self.client.post(
+            "/memory/remember",
+            json={
+                "content": "The preferred editor is Beta.",
+                "keywords": ["preferred editor"],
+                "dedupe": False,
+                "event_time": "2026-08-10T00:00:00Z",
+                "valid_from": "2026-08-10T00:00:00Z",
+            },
+        )
+        self.assertEqual(original.status_code, 200, original.text)
+        self.assertEqual(replacement.status_code, 200, replacement.text)
+        original_id = original.json()["memory"]["id"]
+        replacement_id = replacement.json()["memory"]["id"]
+
+        superseded = self.client.post(
+            f"/memories/{original_id}/supersede",
+            json={
+                "replacement_memory_id": replacement_id,
+                "effective_at": "2026-08-10T00:00:00Z",
+            },
+        )
+        self.assertEqual(superseded.status_code, 200, superseded.text)
+        body = superseded.json()
+        self.assertEqual(body["superseded"]["superseded_by"], replacement_id)
+        self.assertEqual(body["superseded"]["valid_until"], "2026-08-10T00:00:00.000+00:00")
+
+        historical = self.client.post(
+            "/memories/retrieve",
+            json={
+                "query": "preferred editor",
+                "as_of": "2026-08-05T00:00:00Z",
+                "temporal_scope": "current",
+                "update_recall": False,
+            },
+        )
+        self.assertEqual(historical.status_code, 200, historical.text)
+        ids = [item["memory"]["id"] for item in historical.json()["retrieved"]]
+        self.assertIn(original_id, ids)
+        self.assertNotIn(replacement_id, ids)
+
+        not_yet_historical = self.client.post(
+            "/memories/retrieve",
+            json={
+                "query": "preferred editor",
+                "as_of": "2026-08-05T00:00:00Z",
+                "temporal_scope": "historical",
+                "update_recall": False,
+            },
+        )
+        self.assertEqual(not_yet_historical.status_code, 200, not_yet_historical.text)
+        ids = [item["memory"]["id"] for item in not_yet_historical.json()["retrieved"]]
+        self.assertNotIn(original_id, ids)
 
     def test_explicit_legacy_route_creates_confirmed_canonical_memory(self) -> None:
         response = self.client.post(
