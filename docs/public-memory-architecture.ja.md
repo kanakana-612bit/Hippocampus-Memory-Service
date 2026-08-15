@@ -675,7 +675,13 @@ activationとretentionが低下した記憶は、まず通常検索から外し�
 ### 設計済み・未実装または実験段階
 
 - 日次の非同期整理と重複統合
+- 軽量ルールで未抽出となった生ログのSLMによる夜間再評価
 - 自然言語だけから意味上の矛盾を判定する自動競合検出
+- 応答候補の時間主張を決定論的に照合するtemporal gate
+- 訂正時に依存する予定、期限、派生記憶を再評価する処理
+- OpenWebUIから取得する発話IDを含む端点間の冪等性保証
+- 追加source eventとprovenance edgeの整合性検査
+- SLMを補助抽出器に使う主体帰属claim抽出
 - 記憶の確認、訂正、削除を行う管理画面
 
 ## 15. 実装ロードマップ
@@ -802,7 +808,217 @@ OpenWebUI連携では`risk_based`を標準とし、過去会話または記憶�
 確認・訂正・削除画面、誤記憶率、主体取り違え率、検索精度、応答遅延、
 監査検証時間を継続的に評価する。
 
-## 16. 受け入れ基準
+## 16. 実地評価後の改善ロードマップ
+
+実地対話では、保存層が正しい情報を保持できても、自然言語からその情報を抽出する入口と、
+モデルが生成した応答を解釈する出口で取りこぼしが起きた。これは主体帰属と時間認識に
+共通する構造である。
+
+```text
+正しい情報を保存・提供できる
+    !=
+モデルが常に正しく抽出・解釈・利用する
+```
+
+したがって、保存層を拡張するだけでなく、軽量な一次抽出、意味的な補助抽出、
+決定論的な照合を分離する。SLMは曖昧な自然言語を構造化するために使い、記憶の確定、
+主体帰属の正否、時間制約の正否は決定論的なコードと監査済みデータで判定する。
+
+### 16.1 改善点の評価
+
+| 改善点 | 評価 | 現在の保証と不足 |
+|---|---|---|
+| 時刻と整合性 | 妥当。二つの処理へ分ける | 時刻の保持と時点検索は実装済み。訂正の依存伝播と応答時の時間主張検証は未実装 |
+| 短期候補の二段抽出 | 必須 | 軽量ルールは実装済みだが、未抽出生ログを意味的に救済する夜間処理がない |
+| 再試行時の冪等性 | 妥当。現状は部分実装 | 同一event IDの再送は抑止するが、フロントエンドが再試行時に安定したIDを渡す端点間保証がない |
+| provenance edge拡充 | 必須の整合性修正 | 初回固定化時のedgeは作るが、痕跡強化で後から増えたsource IDとの同期保証が不足する |
+| 発話ID取得 | 優先度が高い境界修正 | 実メッセージIDよりリクエストmetadataを優先する経路があり、再試行や分岐で同一性がずれ得る |
+| 帰属claim抽出高度化 | 妥当 | 決定論的照合は維持し、SLMはclaimの構造化だけを補助する |
+| marker解析・除去 | 明確な不具合修正 | `@unknown`など注釈付きmarkerが現行の許容文字から外れ、検証も表示前除去もすり抜け得る |
+
+実装は次の依存順で進める。イベント同一性と来歴が不安定な状態で後段のSLM処理やgateを
+増やすと、誤った根拠を精密に検証することになるため、まず入口の整合性を固定する。
+
+### 16.2 Stage A: イベント同一性と来歴の修正
+
+対象は発話ID、冪等性、provenance edge、memory markerである。後続段階の前提となるため、
+最優先で実装する。
+
+#### 発話ID
+
+- OpenWebUIの各message objectが持つ実IDを最優先する
+- request metadataのIDは、それが対象roleの発話IDだと確認できる場合だけ使う
+- 実IDがない場合は、chat ID、parent ID、role、source time、内容digestから安定IDを作る
+- 配列indexだけをID材料にしない。分岐、履歴編集、再試行でindexが変化するためである
+- user、assistant、tool、内部taskのID名前空間を混同しない
+
+#### 冪等性
+
+冪等性は三層に分ける。
+
+1. 原記録: 同じsource channel、conversation、source event IDの再送は一件として扱う
+2. 抽出処理: `source_event_id + extractor + extractor_version + claim_fingerprint`を一意にする
+3. バッチ処理: job IDと処理watermarkを保存し、途中再開しても同じ候補を二重生成しない
+
+同じIDと同じpayloadの再送は既存結果を返す。同じIDで内容、role、actor、時刻が異なる場合は
+衝突として拒否し、黙って上書きしない。HTTP経路では`Idempotency-Key`も受け入れ、API再試行と
+source eventの同一性を別々に追跡する。
+
+#### provenance edge
+
+- `source_event_ids`と`derived_from`から必要なedge集合を一か所で生成する
+- 痕跡の作成、反復強化、確認、固定化、訂正の全経路で同じ同期関数を呼ぶ
+- 追記型制約を保ち、不足edgeだけを同一トランザクションで追加する
+- 既存edgeを書き換える必要がある訂正は、新しい関係と後継オブジェクトとして表現する
+- `source_event_ids`とedge集合の差分を検査する整合性監査を追加する
+
+#### marker parser
+
+- 正式形式は`[[event:ID]]`と`[[memory:ID]]`のまま維持する
+- 既存応答との互換性のため、`@user`や`@unknown`を伴うmarkerも読み取り、base IDへ正規化する
+- marker生成側ではactorをIDへ連結せず、別フィールドとして提示する
+- 検証できないmarkerも表示前には除去し、内部参照文字列をユーザーへ露出させない
+- 長さと文字種を制限し、過剰に広い正規表現で本文まで消さない
+
+**Stage A受け入れ基準**
+
+- 同じOpenWebUI発話を再送してもraw event、trace、audit eventが増えない
+- 同一IDで異なるpayloadを送ると競合として検出される
+- 実際のuser/assistant message IDが原記録まで保存される
+- traceの全source eventに対応するprovenance edgeが存在する
+- `@unknown`付きmarkerを検証またはunverifiedへ分類でき、最終表示からは完全に除去される
+
+### 16.3 Stage B: 短期記憶候補の二段抽出
+
+リアルタイム処理は高速で高精度な軽量ルールを維持する。ただし、表現辞書を際限なく増やして
+自然言語全体を覆おうとしない。一次抽出で候補化されなかった原記録を、夜間に会話窓単位で
+SLMへ渡し、構造化された候補だけを受け取る。
+
+- 全raw eventへ抽出器version、判定、score、skip reasonを記録する
+- 夜間処理は未処理または`below_capture_threshold`のeventを対象にする
+- 単一発話からepisodic、semantic、prospective、proceduralの複数候補を抽出可能にする
+- assistant由来の提案は`actor_role=assistant`、`content_origin=generated`のまま保持する
+- userの追認、採用、反復、再利用を別eventとしてedgeで結び、ユーザー由来へ書き換えない
+- SLM出力はJSON Schemaで検証し、根拠のないsource IDを拒否する
+- SLMが作る候補は`epistemic_status=inferred`から開始する
+- 夜間抽出と長期固定化を別jobにし、候補生成だけでconfirmedへ昇格させない
+
+長期固定化は、反復、明示的確認、異なる時点での再利用、未完了事項の完了、salience、stabilityを
+根拠にする。ユーザーの「覚えておいて」は従来どおり即時のconfirmed経路とする。
+
+**Stage B受け入れ基準**
+
+- 「美味しかった。新しい派生レシピとして残そうかと思って」のような言い換えから、
+  少なくともinferredな短期候補が作られる
+- 一次抽出で落ちても夜間再評価で候補化でき、元のevent IDとevent timeへ戻れる
+- 同じ夜間jobを再実行しても候補が重複しない
+- assistantの提案がユーザーの要求や好みとして保存されない
+- 分量などが未確定の手順は、確定レシピではなく不完全な推定候補として残る
+
+### 16.4 Stage C: claim抽出器の二段化
+
+主体帰属gateの照合部分は決定論的なまま維持する。SLMへ任せるのは、候補応答から
+「誰が、何を、どの種類の言明として示したと主張しているか」を抽出する処理だけである。
+
+一次ルールで高精度に検出できたclaimはそのまま使う。過去参照らしい表現、marker、記憶参照が
+あるのに一次ルールでclaimを抽出できなかった場合だけ、SLM fallbackを呼ぶ。出力は少なくとも
+次の構造を持つ。
+
+```json
+{
+  "claimed_actor_role": "user",
+  "claim_kind": "speech|request|preference|belief|proposal",
+  "statement": "...",
+  "event_ids": [],
+  "memory_ids": [],
+  "span": {"start": 0, "end": 0},
+  "extraction_confidence": 0.0
+}
+```
+
+SLMのconfidenceは抽出結果を採用するかの補助にだけ使い、`verified`の根拠には使わない。
+正否はactor、content origin、監査状態、proposition一致を既存gateで照合する。timeout、JSON不正、
+曖昧なactorは`unverified`へ倒す。候補digest、抽出器version、モデルIDごとに結果をcacheし、
+同じ応答の再検証コストを抑える。
+
+**Stage C受け入れ基準**
+
+- 日本語の省略、婉曲表現、引用語順の違いから主体帰属claimを構造化できる
+- SLMが誤ったactorを返しても、provenance不一致ならgateが`reject`する
+- claimを含まない通常応答ではSLMを呼ばない
+- timeout時のfail-open／fail-closed方針が設定どおりに動く
+- 追加遅延、fallback率、誤検出率を計測できる
+
+### 16.5 Stage D: temporal consistencyと訂正伝播
+
+時間に関する改善は、保存済み記憶の再評価と応答候補の検証を分けて実装する。
+
+#### 訂正伝播
+
+訂正や`supersede`が行われた場合、元記憶を直接書き換えず、依存するprospective memory、期限、
+派生要約をprovenance graphから列挙する。元のevent timeは観測履歴として不変に保つ。
+
+- 旧記憶のvalidityを閉じ、後継記憶へ`superseded_by`を張る
+- 旧情報から派生した未完了予定を`stale`相当またはreview対象にする
+- 日付を再計算できる派生予定は、新しい記憶として生成して旧予定と関連付ける
+- 自動修正できない内容は`disputed`または`unverified`へ落とし、人手確認を要求する
+- 再評価そのものも監査eventとして記録する
+
+#### temporal gate
+
+応答候補から時間主張だけを抽出し、現在時刻、timezone、event time、validity、supersessionと
+照合する。回答全体の事実性は検証しない。claimは次のような構造へ正規化する。
+
+- claim type: current time、event occurrence、deadline、reminder、relative interval
+- absolute timeまたはtime window
+- tenseとmodality: 過去、現在、予定、期限、回想
+- 根拠event／memory ID
+- timezoneと解釈精度
+
+判定は`verified`、`contradicted`、`unverified`、`not_applicable`とする。例えば現在が8月16日なのに、
+8月13日の予定を未処理の未来リマインドとして提示する候補は`contradicted`にする。一方、
+「8月13日に買い物をした」という回想まで拒否してはいけない。相対表現の構造化にはSLMを
+補助利用できるが、時刻比較と制約判定は決定論的に行う。
+
+主体帰属gateと同様、矛盾候補を除外し、一度だけ限定再生成して再検証する。両gateを通す場合は、
+抽出済みclaimと根拠解決結果を共有し、同じ候補を何度もSLMへ送らない。
+
+**Stage D受け入れ基準**
+
+- 現在日より過去の期限を未来のリマインドとして提示する候補を拒否する
+- 過去の出来事として正しく述べる候補は許可する
+- 訂正前の日付はhistorical検索に残るが、current検索と通常応答では後継日付が優先される
+- 訂正された日付に依存する予定が再評価対象になる
+- timezone不明または曖昧な相対時刻を、誤ってverifiedにしない
+- temporal gate単体と、主体帰属gateとの併用時の遅延を計測できる
+
+### 16.6 Stage E: 夜間運用と評価
+
+Stage BとDの非同期処理を外部schedulerへ接続する。API endpointが存在するだけでは夜間処理は
+実行されないため、運用設定も実装完了条件に含める。
+
+- 単一実行lock、処理watermark、最大件数、timeout、retry、dry-runを持たせる
+- 実行前後に監査checkpointを作成し、失敗時は途中状態を再開可能にする
+- 抽出救済率、誤候補率、自動固定化率、重複抑止数、edge不整合数を記録する
+- attribution／temporal gateの発火率、reject率、再生成率、追加遅延を記録する
+- 代表的な公開fixtureを回帰試験として固定し、辞書、prompt、モデル変更を比較する
+
+この段階まで完了して初めて、「リアルタイムで拾えなかった記憶も夜間に整理され、必要なら
+長期記憶へ自動昇格する」という利用者の期待を、運用を含めて満たしたとみなす。
+
+### 16.7 推奨実装順
+
+1. Stage A: 発話ID、冪等性、edge同期、marker parser
+2. Stage B: 抽出判定の永続化、夜間再抽出、長期固定化job
+3. Stage C: 帰属claimのSLM fallback
+4. Stage D: 訂正伝播、temporal claim抽出、temporal gate
+5. Stage E: scheduler接続、評価指標、回帰fixture
+
+Stage Aは既存データと来歴を守る修正であり、最初に行う。Stage BとCで同じSLM client、
+JSON Schema検証、cache、timeout管理を共有する。Stage Dはその構造化基盤を再利用するが、
+時間制約の判定器自体は独立させる。
+
+## 17. 受け入れ基準
 
 記憶サービスは、少なくとも次を満たす必要がある。
 
@@ -818,7 +1034,7 @@ OpenWebUI連携では`risk_based`を標準とし、過去会話または記憶�
 - ユーザーが記憶を確認、訂正、削除できる
 - 監査機構を有効にしても、通常の応答遅延が許容範囲に収まる
 
-## 17. この設計が保証しないもの
+## 18. この設計が保証しないもの
 
 この仕組みは、AIに人間と同じ記憶や人格が生じることを保証しない。
 また、保存された内容が客観的真実であることも保証しない。
