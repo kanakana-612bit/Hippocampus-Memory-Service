@@ -24,6 +24,7 @@ from automatic_memory import (
 )
 from attribution_gate import extract_claims
 from layered_memory import ClosingConnection, LayeredMemoryStore
+from slm_client import StructuredSLMClient
 from temporal_memory import (
     duration_text,
     infer_temporal_window,
@@ -49,6 +50,42 @@ DEFAULT_OPENWEBUI_DB_PATH = ROOT.parent / "data" / "webui.db"
 DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_LLM_MODEL = "local-memory-extractor"
 MEMORY_EXTRACTION_PROMPT = ROOT / "prompts" / "memory_extraction.ja.md"
+
+STRUCTURED_CLAIM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "enum": ["user", "assistant", "system"]},
+                    "predicate": {
+                        "type": "string",
+                        "enum": ["said", "requested", "preferred", "believed", "proposed"],
+                    },
+                    "content": {"type": "string"},
+                    "evidence_marker": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}]
+                    },
+                },
+                "required": ["subject", "predicate", "content", "evidence_marker"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["claims"],
+    "additionalProperties": False,
+}
+
+PREDICATE_TO_CLAIM_KIND = {
+    "said": "speech",
+    "requested": "request",
+    "preferred": "preference",
+    "believed": "belief",
+    "proposed": "proposal",
+}
+CLAIM_KIND_TO_PREDICATE = {value: key for key, value in PREDICATE_TO_CLAIM_KIND.items()}
 
 MEMORY_TABLES = {
     "episodic": "episodic_memories",
@@ -1857,6 +1894,7 @@ class MemoryManager:
         temperature: float = 0.1,
         max_tokens: int = 2000,
         timeout: int = 120,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         url = self.lmstudio_base_url.rstrip("/") + "/chat/completions"
         payload = {
@@ -1866,6 +1904,8 @@ class MemoryManager:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         request = urllib.request.Request(
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -1878,6 +1918,317 @@ class MemoryManager:
             raise RuntimeError(f"LMStudio HTTP {exc.code}: {detail}") from exc
         data = json.loads(raw)
         return data["choices"][0]["message"]["content"]
+
+    def slm_status(self) -> dict[str, Any]:
+        provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
+        if provider == "ollama":
+            return StructuredSLMClient(model=self._slm_model()).status()
+        model = self._slm_model()
+        url = self.lmstudio_base_url.rstrip("/") + "/models"
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            raw = urllib.request.urlopen(request, timeout=5).read().decode("utf-8")
+            payload = json.loads(raw)
+            models = [str(item.get("id") or "") for item in payload.get("data") or []]
+            return {
+                "provider": "openai",
+                "available": True,
+                "base_url": self.lmstudio_base_url,
+                "model": model,
+                "model_available": model in models,
+                "models": models,
+                "configured_keep_alive": None,
+            }
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return {
+                "provider": "openai",
+                "available": False,
+                "base_url": self.lmstudio_base_url,
+                "model": model,
+                "configured_keep_alive": None,
+                "error": str(exc),
+            }
+
+    def preload_slm(self) -> dict[str, Any]:
+        provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
+        if provider != "ollama":
+            raise ValueError("SLM preloading is available when HIPPOCAMPUS_SLM_PROVIDER=ollama")
+        return StructuredSLMClient(model=self._slm_model()).preload()
+
+    def _slm_model(self) -> str:
+        return (
+            os.getenv("HIPPOCAMPUS_SLM_MODEL")
+            or os.getenv("HIPPOCAMPUS_CLAIM_SLM_MODEL")
+            or self.llm_model
+        )
+
+    def _structured_slm_completion(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        schema: dict[str, Any],
+        max_tokens: int = 1200,
+    ) -> dict[str, Any]:
+        provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
+        model = self._slm_model()
+        if provider == "ollama":
+            return StructuredSLMClient(model=model).structured_chat(
+                messages=messages,
+                schema=schema,
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+        if provider not in {"openai", "lmstudio"}:
+            raise ValueError(f"Unsupported HIPPOCAMPUS_SLM_PROVIDER: {provider}")
+        started = time.monotonic()
+        content = self.chat_completion(
+            model=model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            timeout=int(os.getenv("HIPPOCAMPUS_CLAIM_SLM_TIMEOUT_SECONDS", "90")),
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "hippocampus_structured_claims",
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        )
+        return {
+            "content": content,
+            "provider": "openai",
+            "model": model,
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "load_duration_ms": 0.0,
+            "prompt_eval_count": 0,
+            "eval_count": 0,
+        }
+
+    @staticmethod
+    def _claim_markers(content: str) -> list[str]:
+        markers: list[str] = []
+        for match in re.finditer(
+            r"\[\[(event|memory):([^@\]]+)(?:@[^\]]+)?\]\]",
+            content,
+            flags=re.I,
+        ):
+            markers.append(f"{match.group(1).lower()}:{match.group(2).strip()}")
+        return unique_list(markers)
+
+    @staticmethod
+    def _conversational_actor_hint(content: str, source_role: str) -> str | None:
+        prefix = re.split(r"[「『\"]", content.strip(), maxsplit=1)[0]
+        prefix = re.sub(r"\s+", " ", prefix)
+        lead = r"(?:^|[。！？]\s*)(?:前に|以前(?:に)?|かつて|previously\s+)?"
+        if re.search(lead + r"(?:君|あなた|you)\s*(?:は|が|も)", prefix, flags=re.I):
+            return "assistant" if source_role == "user" else "user"
+        if re.search(lead + r"(?:私|僕|わたし|I)\s*(?:は|が|も)", prefix, flags=re.I):
+            return source_role
+        return None
+
+    @staticmethod
+    def _single_quoted_proposition(content: str) -> str | None:
+        matches = re.findall(r"「([^」]{1,1000})」|『([^』]{1,1000})』", content)
+        values = [left or right for left, right in matches if left or right]
+        return values[0].strip() if len(values) == 1 else None
+
+    def extract_structured_claims(
+        self,
+        *,
+        content: str,
+        source_role: str = "assistant",
+        evidence_markers: list[str] | None = None,
+        event_ids: list[str] | None = None,
+        memory_ids: list[str] | None = None,
+        risk_filter: bool = True,
+    ) -> dict[str, Any]:
+        if source_role not in {"user", "assistant", "system"}:
+            raise ValueError("source_role must be user, assistant, or system")
+        model = self._slm_model()
+        provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
+        if risk_filter and not self._attribution_risk(content):
+            return {
+                "format": "hippocampus.structured-claims.v1",
+                "source_role": source_role,
+                "claims": [],
+                "gate_claims": [],
+                "provider": provider,
+                "model": model,
+                "duration_ms": 0.0,
+                "load_duration_ms": 0.0,
+                "prompt_eval_count": 0,
+                "eval_count": 0,
+                "cached": False,
+                "skipped_reason": "no_attribution_risk",
+            }
+        supplied_event_ids = {str(value) for value in event_ids or [] if str(value)}
+        supplied_memory_ids = {str(value) for value in memory_ids or [] if str(value)}
+        inline_markers = self._claim_markers(content)
+        allowed_markers = unique_list(
+            [str(value) for value in evidence_markers or [] if str(value)],
+            [f"event:{value}" for value in sorted(supplied_event_ids)],
+            [f"memory:{value}" for value in sorted(supplied_memory_ids)],
+            inline_markers,
+        )
+        marker_set = set(allowed_markers)
+        digest_payload = dumps(
+            {
+                "content": content,
+                "source_role": source_role,
+                "evidence_markers": allowed_markers,
+            }
+        )
+        candidate_digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(
+            f"structured_claim_v2\0{provider}\0{model}\0{candidate_digest}".encode("utf-8")
+        ).hexdigest()
+        with self.connect() as con:
+            cached = con.execute(
+                "SELECT response_json FROM claim_extraction_cache WHERE cache_key=?",
+                (cache_key,),
+            ).fetchone()
+        if cached is not None:
+            result = loads(cached["response_json"], {})
+            result["cached"] = True
+            return result
+
+        marker_instruction = (
+            "Allowed evidence_marker values are: " + dumps(allowed_markers) + ". "
+            "Use null when none of these markers directly supports the claim."
+            if allowed_markers
+            else "No evidence markers are available, so evidence_marker must be null."
+        )
+        prompt = (
+            "Transform the supplied text into attribution claims only. A claim says that user, "
+            "assistant, or system previously said, requested, preferred, believed, or proposed "
+            "something. Do not assess truth, correctness, or whether the evidence is sufficient. "
+            "The subject is the attributed speaker, not necessarily the author of the current text. "
+            "Resolve conversational pronouns from the current text author: when source_role=user, "
+            "first-person words such as 私/僕/I mean user and second-person words such as 君/あなた/you "
+            "mean assistant; when source_role=assistant, first person means assistant and second person "
+            "means user. Preserve the language and wording of the attributed proposition; do not translate it. "
+            "Examples: with source_role=user, 『君は以前「案Cもある」と提案した』 has subject=assistant; "
+            "with source_role=assistant, 『あなたが以前「案Bがよい」と言った』 has subject=user. "
+            "Do not invent a claim or evidence marker. Return an empty claims array when the text "
+            "contains no attribution claim. "
+            f"The current text author is {source_role}. {marker_instruction}\n\n"
+            f"Text:\n{content}"
+        )
+        completion = self._structured_slm_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a narrow source-attribution claim extractor. Return only data that "
+                        "matches the supplied JSON schema; validation happens outside the model."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            schema=STRUCTURED_CLAIM_SCHEMA,
+            max_tokens=1200,
+        )
+        payload = self.parse_json_object(str(completion.get("content") or ""))
+        claims: list[dict[str, Any]] = []
+        gate_claims: list[dict[str, Any]] = []
+        payload_claims = payload.get("claims") or []
+        actor_hint = self._conversational_actor_hint(content, source_role)
+        quoted_proposition = self._single_quoted_proposition(content)
+        for index, item in enumerate(payload_claims):
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject") or item.get("claimed_actor_role") or "").lower()
+            predicate = str(item.get("predicate") or "").lower()
+            if not predicate:
+                predicate = CLAIM_KIND_TO_PREDICATE.get(str(item.get("claim_kind") or ""), "")
+            claim_content = re.sub(
+                r"\s+", " ", str(item.get("content") or item.get("statement") or "")
+            ).strip()
+            if len(payload_claims) == 1 and actor_hint is not None:
+                subject = actor_hint
+            if len(payload_claims) == 1 and quoted_proposition is not None:
+                claim_content = quoted_proposition
+            if subject not in {"user", "assistant", "system"}:
+                continue
+            if predicate not in PREDICATE_TO_CLAIM_KIND or not claim_content:
+                continue
+
+            marker = item.get("evidence_marker")
+            marker = str(marker).strip() if marker is not None else None
+            if marker is None and len(payload_claims) == 1 and len(inline_markers) == 1:
+                marker = inline_markers[0]
+            legacy_events = [str(value) for value in item.get("event_ids") or []]
+            legacy_memories = [str(value) for value in item.get("memory_ids") or []]
+            if marker not in marker_set:
+                marker = None
+            filtered_events = [value for value in legacy_events if value in supplied_event_ids]
+            filtered_memories = [value for value in legacy_memories if value in supplied_memory_ids]
+            if marker and marker.startswith("event:"):
+                marker_id = marker.split(":", 1)[1]
+                if marker_id:
+                    filtered_events = unique_list(filtered_events, [marker_id])
+            elif marker and marker.startswith("memory:"):
+                marker_id = marker.split(":", 1)[1]
+                if marker_id:
+                    filtered_memories = unique_list(filtered_memories, [marker_id])
+            elif marker and marker in supplied_event_ids:
+                filtered_events = unique_list(filtered_events, [marker])
+            elif marker and marker in supplied_memory_ids:
+                filtered_memories = unique_list(filtered_memories, [marker])
+
+            claims.append(
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "content": claim_content,
+                    "evidence_marker": marker,
+                }
+            )
+            gate_claims.append(
+                {
+                    "claim_id": f"slm_claim_{index + 1}",
+                    "sentence": claim_content,
+                    "claimed_actor_role": subject,
+                    "claim_kind": PREDICATE_TO_CLAIM_KIND[predicate],
+                    "statement": claim_content,
+                    "event_ids": filtered_events,
+                    "memory_ids": filtered_memories,
+                    "detection": "slm_structure_v1",
+                }
+            )
+        result = {
+            "format": "hippocampus.structured-claims.v1",
+            "source_role": source_role,
+            "claims": claims,
+            "gate_claims": gate_claims,
+            "provider": completion.get("provider") or provider,
+            "model": completion.get("model") or model,
+            "duration_ms": float(completion.get("duration_ms") or 0.0),
+            "load_duration_ms": float(completion.get("load_duration_ms") or 0.0),
+            "prompt_eval_count": int(completion.get("prompt_eval_count") or 0),
+            "eval_count": int(completion.get("eval_count") or 0),
+            "cached": False,
+        }
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO claim_extraction_cache
+                (cache_key, candidate_digest, extractor, extractor_version, model, response_json, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    cache_key,
+                    candidate_digest,
+                    "slm",
+                    "structured_claim_v2",
+                    f"{provider}:{model}",
+                    dumps(result),
+                    utc_now(),
+                ),
+            )
+        return result
 
     def compact_transcript(self, messages: list[dict[str, Any]], max_chars: int = 24000) -> str:
         lines = []
@@ -3419,74 +3770,10 @@ class MemoryManager:
             "1", "true", "yes", "on", "enabled"
         }:
             return []
-
-        model = os.getenv("HIPPOCAMPUS_CLAIM_SLM_MODEL") or self.llm_model
-        candidate_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        cache_key = hashlib.sha256(
-            f"claim_slm_v1\0{model}\0{candidate_digest}".encode("utf-8")
-        ).hexdigest()
-        with self.connect() as con:
-            cached = con.execute(
-                "SELECT response_json FROM claim_extraction_cache WHERE cache_key=?",
-                (cache_key,),
-            ).fetchone()
-        if cached is not None:
-            return loads(cached["response_json"], [])
-
-        prompt = (
-            "Extract only claims that attribute a past statement, request, preference, belief, "
-            "or proposal to user, assistant, or system. Do not judge whether a claim is true. "
-            "Output JSON only as {\"claims\":[{\"claimed_actor_role\":\"user|assistant|system\","
-            "\"claim_kind\":\"speech|request|preference|belief|proposal\","
-            "\"statement\":\"attributed proposition\",\"event_ids\":[],\"memory_ids\":[]}]}. "
-            "Return an empty claims list when there is no attribution claim. Preserve any exact "
-            "event or memory IDs appearing in [[event:ID]] or [[memory:ID]] markers.\n\n"
-            f"Candidate response:\n{content}"
-        )
-        raw = self.chat_completion(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Extract attribution claims as JSON. Never validate them."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=1200,
-            timeout=int(os.getenv("HIPPOCAMPUS_CLAIM_SLM_TIMEOUT_SECONDS", "90")),
-        )
-        payload = self.parse_json_object(raw)
-        claims: list[dict[str, Any]] = []
-        for index, claim in enumerate(payload.get("claims") or []):
-            if not isinstance(claim, dict):
-                continue
-            actor = str(claim.get("claimed_actor_role") or "")
-            kind = str(claim.get("claim_kind") or "speech")
-            statement = re.sub(r"\s+", " ", str(claim.get("statement") or "")).strip()
-            if actor not in {"user", "assistant", "system"} or kind not in {
-                "speech", "request", "preference", "belief", "proposal"
-            } or not statement:
-                continue
-            claims.append(
-                {
-                    "claim_id": str(claim.get("claim_id") or f"slm_claim_{index + 1}"),
-                    "sentence": str(claim.get("sentence") or statement),
-                    "claimed_actor_role": actor,
-                    "claim_kind": kind,
-                    "statement": statement,
-                    "event_ids": [str(value) for value in claim.get("event_ids") or []],
-                    "memory_ids": [str(value) for value in claim.get("memory_ids") or []],
-                    "detection": "slm_structure_v1",
-                }
-            )
-        with self.connect() as con:
-            con.execute(
-                """
-                INSERT OR REPLACE INTO claim_extraction_cache
-                (cache_key, candidate_digest, extractor, extractor_version, model, response_json, created_at)
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (cache_key, candidate_digest, "slm", "claim_v1", model, dumps(claims), utc_now()),
-            )
-        return claims
+        return self.extract_structured_claims(
+            content=content,
+            source_role="assistant",
+        )["gate_claims"]
 
     @staticmethod
     def _attribution_risk(content: str) -> bool:

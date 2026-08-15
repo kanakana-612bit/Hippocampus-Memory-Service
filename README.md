@@ -86,6 +86,12 @@ HIPPOCAMPUS_DB=./data/hippocampus.db
 LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
 HIPPOCAMPUS_LLM_MODEL=local-memory-extractor
 HIPPOCAMPUS_TIMEZONE=UTC
+HIPPOCAMPUS_SLM_PROVIDER=ollama
+HIPPOCAMPUS_SLM_BASE_URL=http://127.0.0.1:11434
+HIPPOCAMPUS_SLM_MODEL=qwen3.5:4b
+HIPPOCAMPUS_SLM_KEEP_ALIVE=-1
+HIPPOCAMPUS_SLM_PRELOAD_ON_START=0
+HIPPOCAMPUS_CLAIM_SLM_ENABLED=0
 OPENWEBUI_DB=../data/webui.db
 HIPPOCAMPUS_SECURITY_DIR=./data/.hippocampus-security
 HIPPOCAMPUS_BACKUP_DIR=./data/backups
@@ -95,6 +101,43 @@ HIPPOCAMPUS_BACKUP_DIR=./data/backups
 `LMSTUDIO_BASE_URL` may point to any OpenAI-compatible local chat completions
 server. LLM extraction is optional; the service also has a lightweight
 heuristic fallback.
+
+## Optional Resident SLM
+
+Hippocampus can use a small Ollama model to structure attribution claims while
+leaving the final actor and provenance decision deterministic. Install Ollama,
+pull a local model, enable `HIPPOCAMPUS_CLAIM_SLM_ENABLED=1`, and keep
+`HIPPOCAMPUS_SLM_KEEP_ALIVE=-1` to retain the model in memory after preload.
+Set `HIPPOCAMPUS_SLM_PRELOAD_ON_START=1` when the service should load it in a
+background thread after every restart.
+
+```powershell
+ollama pull qwen3.5:4b
+Invoke-RestMethod -Method Post http://127.0.0.1:8091/slm/preload
+Invoke-RestMethod -Method Post http://127.0.0.1:8091/slm/claims/extract `
+  -ContentType 'application/json' `
+  -Body '{
+    "source_role":"assistant",
+    "content":"The user previously said that option A was preferred.",
+    "event_ids":["example-event"],
+    "validate_attribution":true
+  }'
+```
+
+`GET /status/slm` reports whether the server, configured model, and resident
+model are available. The extraction response contains the public machine format
+`subject`, `predicate`, `content`, and `evidence_marker`, plus `gate_claims` for
+the existing attribution validator. An evidence marker is accepted only when it
+appears in the input or is supplied by the caller; the SLM cannot authorize an
+invented source ID. The route applies the lightweight attribution-risk filter
+before inference by default; pass `"risk_filter": false` only for extractor
+evaluation cases that intentionally bypass that first stage.
+
+To use an already resident model on an LM Studio or another OpenAI-compatible
+server, set `HIPPOCAMPUS_SLM_PROVIDER=openai` and set
+`HIPPOCAMPUS_SLM_MODEL` to its served model ID. The structured claim route sends
+an OpenAI-compatible `response_format=json_schema`; preload and keep-alive are
+then managed by the remote model server.
 
 ## Seed Demo Data
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
+from threading import Thread
 from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -13,11 +16,29 @@ class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
 
+def _preload_configured_slm() -> None:
+    try:
+        manager.preload_slm()
+    except (RuntimeError, ValueError):
+        # Availability remains visible through GET /status/slm.
+        return
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if os.getenv("HIPPOCAMPUS_SLM_PRELOAD_ON_START", "0").strip().lower() in {
+        "1", "true", "yes", "on", "enabled"
+    }:
+        Thread(target=_preload_configured_slm, name="hippocampus-slm-preload", daemon=True).start()
+    yield
+
+
 app = FastAPI(
     title="Hippocampus Memory Service",
-    version="0.8.0",
+    version="0.9.0",
     description="Layered short-term and long-term memory service for local chat frontends.",
     default_response_class=UTF8JSONResponse,
+    lifespan=lifespan,
 )
 
 manager = MemoryManager()
@@ -398,6 +419,18 @@ class TemporalValidateRequest(BaseModel):
     timezone: str | None = None
 
 
+class StructuredClaimExtractionRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100000)
+    source_role: Literal["user", "assistant", "system"] = "assistant"
+    evidence_markers: list[str] = Field(default_factory=list, max_length=200)
+    event_ids: list[str] = Field(default_factory=list, max_length=200)
+    memory_ids: list[str] = Field(default_factory=list, max_length=100)
+    conversation_id: str | None = None
+    risk_filter: bool = True
+    validate_attribution: bool = False
+    threshold: float = Field(default=0.46, ge=0.20, le=0.95)
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, **manager.stats()}
@@ -441,6 +474,48 @@ def nightly_status() -> dict[str, Any]:
 @app.get("/status/attribution-gate")
 def attribution_gate_status() -> dict[str, Any]:
     return manager.attribution_gate_status()
+
+
+@app.get("/status/slm")
+def slm_status() -> dict[str, Any]:
+    return manager.slm_status()
+
+
+@app.post("/slm/preload")
+def preload_slm() -> dict[str, Any]:
+    try:
+        return manager.preload_slm()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/slm/claims/extract")
+def extract_structured_claims(req: StructuredClaimExtractionRequest) -> dict[str, Any]:
+    try:
+        result = manager.extract_structured_claims(
+            content=req.content,
+            source_role=req.source_role,
+            evidence_markers=req.evidence_markers,
+            event_ids=req.event_ids,
+            memory_ids=req.memory_ids,
+            risk_filter=req.risk_filter,
+        )
+        if req.validate_attribution:
+            result["validation"] = manager.validate_response_attribution(
+                content=req.content,
+                conversation_id=req.conversation_id,
+                event_ids=req.event_ids,
+                memory_ids=req.memory_ids,
+                claims=result["gate_claims"],
+                threshold=req.threshold,
+            )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/attribution/validate")

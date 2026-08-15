@@ -160,9 +160,12 @@ class HardeningTests(unittest.TestCase):
             },
             ensure_ascii=False,
         )
-        with patch.dict(os.environ, {"HIPPOCAMPUS_CLAIM_SLM_ENABLED": "1"}), patch.object(
+        with patch.dict(
+            os.environ,
+            {"HIPPOCAMPUS_CLAIM_SLM_ENABLED": "1", "HIPPOCAMPUS_SLM_PROVIDER": "openai"},
+        ), patch.object(
             self.manager, "chat_completion", return_value=structured
-        ):
+        ) as completion:
             result = self.manager.validate_response_attribution(
                 content="君の言葉だったはずの『AにはCの側面もある』を再検討する。",
                 conversation_id="claim-chat",
@@ -171,6 +174,120 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(result["decision"], "reject")
         self.assertEqual(result["claims"][0]["detection"], "slm_structure_v1")
         self.assertEqual(result["claims"][0]["best_evidence"]["actor_role"], "assistant")
+        self.assertEqual(
+            completion.call_args.kwargs["response_format"]["type"],
+            "json_schema",
+        )
+
+    def test_structured_claim_extraction_only_accepts_supplied_evidence_markers(self) -> None:
+        structured = json.dumps(
+            {
+                "claims": [
+                    {
+                        "subject": "user",
+                        "predicate": "said",
+                        "content": "Aについて話した",
+                        "evidence_marker": "event:invented-source",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        completion = {
+            "content": structured,
+            "provider": "ollama",
+            "model": "test-model",
+            "duration_ms": 10.0,
+        }
+        with patch.object(self.manager, "_structured_slm_completion", return_value=completion):
+            result = self.manager.extract_structured_claims(
+                content="ユーザーは以前Aについて話した。",
+                source_role="assistant",
+            )
+
+        self.assertEqual(result["claims"][0]["evidence_marker"], None)
+        self.assertEqual(result["gate_claims"][0]["event_ids"], [])
+
+    def test_structured_claim_marker_is_converted_for_deterministic_gate(self) -> None:
+        self.manager.ingest_messages(
+            "structured-claim-chat",
+            [{"id": "source-user-1", "role": "user", "content": "Aについて話した。"}],
+            auto_capture=False,
+        )
+        structured = json.dumps(
+            {
+                "claims": [
+                    {
+                        "subject": "user",
+                        "predicate": "said",
+                        "content": "Aについて話した",
+                        "evidence_marker": "event:source-user-1",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        completion = {
+            "content": structured,
+            "provider": "ollama",
+            "model": "test-model",
+            "duration_ms": 10.0,
+        }
+        with patch.object(self.manager, "_structured_slm_completion", return_value=completion):
+            result = self.manager.extract_structured_claims(
+                content="前にユーザーがAについて話した。",
+                source_role="assistant",
+                event_ids=["source-user-1"],
+            )
+        validation = self.manager.validate_response_attribution(
+            content="前にユーザーがAについて話した。",
+            conversation_id="structured-claim-chat",
+            event_ids=["source-user-1"],
+            claims=result["gate_claims"],
+        )
+
+        self.assertEqual(result["claims"][0]["evidence_marker"], "event:source-user-1")
+        self.assertEqual(result["gate_claims"][0]["event_ids"], ["source-user-1"])
+        self.assertEqual(validation["decision"], "allow")
+
+    def test_clear_second_person_and_quote_are_normalized_outside_slm(self) -> None:
+        structured = json.dumps(
+            {
+                "claims": [
+                    {
+                        "subject": "user",
+                        "predicate": "proposed",
+                        "content": "translated model paraphrase",
+                        "evidence_marker": None,
+                    }
+                ]
+            }
+        )
+        completion = {
+            "content": structured,
+            "provider": "ollama",
+            "model": "test-model",
+            "duration_ms": 10.0,
+        }
+        with patch.object(self.manager, "_structured_slm_completion", return_value=completion):
+            result = self.manager.extract_structured_claims(
+                content="君は以前、「AにはCの側面がある」と提案した。",
+                source_role="user",
+            )
+
+        self.assertEqual(result["claims"][0]["subject"], "assistant")
+        self.assertEqual(result["claims"][0]["content"], "AにはCの側面がある")
+
+    def test_structured_claim_route_skips_non_attribution_text_before_slm(self) -> None:
+        with patch.object(self.manager, "_structured_slm_completion") as completion:
+            result = self.manager.extract_structured_claims(
+                content="今日は抽出器の速度を測定します。",
+                source_role="user",
+            )
+
+        completion.assert_not_called()
+        self.assertEqual(result["claims"], [])
+        self.assertEqual(result["skipped_reason"], "no_attribution_risk")
 
     def test_temporal_gate_rejects_date_mismatch_and_past_reminder(self) -> None:
         wrong_today = self.manager.validate_response_temporal(

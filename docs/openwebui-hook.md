@@ -134,7 +134,11 @@ answer. They only check actor attribution and explicit temporal consistency.
 This narrow scope keeps the final decision deterministic and allows Phase 4
 and Phase 5 evidence to be reused directly. Optional SLM claim extraction is
 enabled in the Hippocampus service with `HIPPOCAMPUS_CLAIM_SLM_ENABLED=1`; the
-SLM structures claims but never decides whether they are valid.
+SLM structures claims but never decides whether they are valid. Set
+`HIPPOCAMPUS_SLM_PROVIDER=ollama`, select the local model with
+`HIPPOCAMPUS_SLM_MODEL`, and use `POST /slm/preload` when the model should stay
+resident. Both user input and assistant drafts can be sent to
+`POST /slm/claims/extract` with the corresponding `source_role`.
 
 When the frontend has an original timestamp, send it as `event_time` together
 with its IANA `timezone`. If it does not, omit it; Hippocampus records the value

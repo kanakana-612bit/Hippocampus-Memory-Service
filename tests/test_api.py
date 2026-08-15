@@ -6,6 +6,7 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -26,6 +27,7 @@ class LayeredMemoryApiTests(unittest.TestCase):
         import app as app_module
 
         cls.client = TestClient(app_module.app)
+        cls.manager = app_module.manager
         cls.security_dir = app_module.manager.layered.security.security_dir
 
     @classmethod
@@ -90,6 +92,33 @@ class LayeredMemoryApiTests(unittest.TestCase):
         self.assertTrue(body["complete"])
         self.assertEqual(body["missing_objects"], [])
         self.assertTrue(all(body["capabilities"].values()))
+
+    def test_structured_slm_claim_route_accepts_user_or_assistant_input(self) -> None:
+        extracted = {
+            "format": "hippocampus.structured-claims.v1",
+            "source_role": "assistant",
+            "claims": [
+                {
+                    "subject": "user",
+                    "predicate": "said",
+                    "content": "A was discussed",
+                    "evidence_marker": None,
+                }
+            ],
+            "gate_claims": [],
+            "provider": "ollama",
+            "model": "test-model",
+            "duration_ms": 1.0,
+            "cached": False,
+        }
+        with patch.object(self.manager, "extract_structured_claims", return_value=extracted):
+            response = self.client.post(
+                "/slm/claims/extract",
+                json={"source_role": "assistant", "content": "The user discussed A."},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["claims"][0]["subject"], "user")
 
     def test_phase2_ingest_and_status(self) -> None:
         status = self.client.get("/status/phase2")
