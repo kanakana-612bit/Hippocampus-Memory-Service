@@ -461,6 +461,59 @@ BEGIN
     SELECT RAISE(ABORT, 'audit_checkpoints is append-only');
 END;
 
+CREATE TABLE IF NOT EXISTS ingest_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_decisions (
+    decision_id TEXT PRIMARY KEY,
+    source_event_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    score REAL NOT NULL DEFAULT 0.0,
+    reason TEXT NOT NULL,
+    trace_ids_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(source_event_id, extractor, extractor_version)
+);
+
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    watermark TEXT,
+    request_digest TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS claim_extraction_cache (
+    cache_key TEXT PRIMARY KEY,
+    candidate_digest TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    model TEXT,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gate_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    gate_type TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    applicable INTEGER NOT NULL,
+    duration_ms REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     memory_id UNINDEXED,
     memory_type UNINDEXED,
@@ -544,3 +597,18 @@ CREATE INDEX IF NOT EXISTS idx_key_rotations_keys
 
 CREATE INDEX IF NOT EXISTS idx_branch_adoptions_branch
     ON audit_branch_adoptions(branch_id, sequence);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_decisions_conversation
+    ON extraction_decisions(conversation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_decisions_source
+    ON extraction_decisions(source_event_id, extractor_version);
+
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_type
+    ON batch_jobs(job_type, started_at);
+
+CREATE INDEX IF NOT EXISTS idx_claim_cache_digest
+    ON claim_extraction_cache(candidate_digest, extractor_version);
+
+CREATE INDEX IF NOT EXISTS idx_gate_evaluations_type
+    ON gate_evaluations(gate_type, created_at);

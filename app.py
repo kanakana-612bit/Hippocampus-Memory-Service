@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -15,7 +15,7 @@ class UTF8JSONResponse(JSONResponse):
 
 app = FastAPI(
     title="Hippocampus Memory Service",
-    version="0.7.0",
+    version="0.8.0",
     description="Layered short-term and long-term memory service for local chat frontends.",
     default_response_class=UTF8JSONResponse,
 )
@@ -49,6 +49,7 @@ class IngestRequest(BaseModel):
     auto_capture: bool = True
     capture_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
     default_timezone: str | None = None
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class RetrieveRequest(BaseModel):
@@ -277,6 +278,23 @@ class MemoryMaintenanceRequest(BaseModel):
     archive_below_threshold: bool = True
 
 
+class NightlyExtractionRequest(BaseModel):
+    conversation_id: str | None = None
+    since: str | None = None
+    limit: int = Field(default=120, ge=1, le=500)
+    model: str | None = None
+    dry_run: bool = False
+
+
+class NightlyCycleRequest(BaseModel):
+    since_hours: int = Field(default=36, ge=1, le=24 * 30)
+    conversation_id: str | None = None
+    limit: int = Field(default=120, ge=1, le=500)
+    model: str | None = None
+    auto_consolidate: bool = False
+    dry_run: bool = False
+
+
 class LongTermMemoryPatch(BaseModel):
     memory_type: Literal["episodic", "semantic", "prospective", "procedural", "embodied"] | None = None
     title: str | None = None
@@ -369,6 +387,15 @@ class CandidateSelectRequest(BaseModel):
     event_ids: list[str] = Field(default_factory=list, max_length=200)
     memory_ids: list[str] = Field(default_factory=list, max_length=100)
     threshold: float = Field(default=0.46, ge=0.20, le=0.95)
+    validate_temporal: bool = True
+    as_of: str | None = None
+    timezone: str | None = None
+
+
+class TemporalValidateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100000)
+    as_of: str | None = None
+    timezone: str | None = None
 
 
 @app.get("/health")
@@ -401,6 +428,16 @@ def phase5_status() -> dict[str, Any]:
     return manager.phase5_status()
 
 
+@app.get("/status/hardening")
+def hardening_status() -> dict[str, Any]:
+    return manager.hardening_status()
+
+
+@app.get("/status/nightly")
+def nightly_status() -> dict[str, Any]:
+    return manager.nightly_status()
+
+
 @app.get("/status/attribution-gate")
 def attribution_gate_status() -> dict[str, Any]:
     return manager.attribution_gate_status()
@@ -430,7 +467,22 @@ def select_response_candidate(req: CandidateSelectRequest) -> dict[str, Any]:
         event_ids=req.event_ids,
         memory_ids=req.memory_ids,
         threshold=req.threshold,
+        validate_temporal=req.validate_temporal,
+        as_of=req.as_of,
+        timezone=req.timezone,
     )
+
+
+@app.post("/temporal/validate")
+def validate_response_temporal(req: TemporalValidateRequest) -> dict[str, Any]:
+    try:
+        return manager.validate_response_temporal(
+            content=req.content,
+            as_of=req.as_of,
+            timezone=req.timezone,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/audit/checkpoints")
@@ -550,7 +602,10 @@ def seed(req: SeedRequest) -> dict[str, Any]:
 
 
 @app.post("/memory/ingest")
-def ingest(req: IngestRequest) -> dict[str, Any]:
+def ingest(
+    req: IngestRequest,
+    idempotency_key_header: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
     try:
         return manager.ingest_messages(
             req.conversation_id,
@@ -558,6 +613,7 @@ def ingest(req: IngestRequest) -> dict[str, Any]:
             auto_capture=req.auto_capture,
             capture_threshold=req.capture_threshold,
             default_timezone=req.default_timezone,
+            idempotency_key=req.idempotency_key or idempotency_key_header,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -714,6 +770,14 @@ def patch_memory_trace(trace_id: str, patch: MemoryTracePatch) -> dict[str, Any]
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.delete("/memory/traces/{trace_id}")
+def forget_memory_trace(trace_id: str, reason: str = "user_requested") -> dict[str, Any]:
+    try:
+        return manager.forget_memory_trace(trace_id, reason=reason)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/memory/traces/{trace_id}/recall")
 def recall_memory_trace(trace_id: str) -> dict[str, Any]:
     try:
@@ -764,6 +828,35 @@ def maintain_memory_layers(req: MemoryMaintenanceRequest) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/memory/nightly/extract")
+def run_nightly_extraction(req: NightlyExtractionRequest) -> dict[str, Any]:
+    try:
+        return manager.run_nightly_extraction(
+            conversation_id=req.conversation_id,
+            since=req.since,
+            limit=req.limit,
+            model=req.model,
+            dry_run=req.dry_run,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/memory/nightly/run")
+def run_nightly_cycle(req: NightlyCycleRequest) -> dict[str, Any]:
+    try:
+        return manager.run_nightly_cycle(
+            since_hours=req.since_hours,
+            conversation_id=req.conversation_id,
+            limit=req.limit,
+            model=req.model,
+            auto_consolidate=req.auto_consolidate,
+            dry_run=req.dry_run,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/memories/retrieve")

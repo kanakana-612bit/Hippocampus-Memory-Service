@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+from memory_manager import MemoryManager
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TEST_TMP = ROOT / "tmp-tests"
+
+
+class HardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        TEST_TMP.mkdir(parents=True, exist_ok=True)
+        self.db_path = TEST_TMP / f"hardening-{uuid.uuid4().hex}.db"
+        self.manager = MemoryManager(self.db_path)
+        self.security_dir = self.manager.layered.security.security_dir
+
+    def tearDown(self) -> None:
+        for path in TEST_TMP.glob(f"{self.db_path.stem}*"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink()
+        shutil.rmtree(self.security_dir, ignore_errors=True)
+
+    def test_recipe_expression_becomes_a_short_term_candidate(self) -> None:
+        result = self.manager.ingest_messages(
+            "recipe-evaluation",
+            [
+                {
+                    "id": "recipe-1",
+                    "role": "user",
+                    "content": (
+                        "そこにレモンを絞って少し入れるアレンジを加えたら、美味しかったんだ。"
+                        "新しい派生レシピとして残そうかと思って。"
+                    ),
+                }
+            ],
+        )
+
+        self.assertEqual(result["automatic_capture"]["created"], 1)
+        trace = self.manager.get_memory_trace(result["memory_traces"][0])
+        self.assertEqual(trace["candidate_memory_type"], "procedural")
+        self.assertIn("recipe-1", trace["source_event_ids"])
+        self.assertEqual(trace["epistemic_status"], "inferred")
+
+    def test_ingest_idempotency_replays_without_duplicate_work(self) -> None:
+        payload = [
+            {"id": "idempotent-1", "role": "user", "content": "この新しいレシピを残そう。"}
+        ]
+        first = self.manager.ingest_messages(
+            "idempotent-chat", payload, idempotency_key="request-1"
+        )
+        replay = self.manager.ingest_messages(
+            "idempotent-chat", payload, idempotency_key="request-1"
+        )
+
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(first["memory_traces"], replay["memory_traces"])
+        self.assertEqual(len(self.manager.list_memory_traces(conversation_id="idempotent-chat")), 1)
+        with self.manager.connect() as con:
+            self.assertEqual(con.execute("SELECT count(*) FROM ingest_requests").fetchone()[0], 1)
+
+    def test_reinforcement_adds_provenance_for_every_source(self) -> None:
+        content = "美味しい新しいレシピとして残そう。"
+        first = self.manager.ingest_messages(
+            "provenance-reinforcement",
+            [{"id": "source-a", "role": "user", "content": content}],
+        )
+        second = self.manager.ingest_messages(
+            "provenance-reinforcement",
+            [{"id": "source-b", "role": "user", "content": content}],
+        )
+        trace_id = first["memory_traces"][0]
+
+        self.assertEqual(second["memory_traces"], [trace_id])
+        trace = self.manager.get_memory_trace(trace_id)
+        self.assertEqual(set(trace["source_event_ids"]), {"source-a", "source-b"})
+        self.assertEqual(
+            {item["object_id"] for item in trace["derived_from"]},
+            {"source-a", "source-b"},
+        )
+        provenance = self.manager.get_provenance("memory_trace", trace_id)
+        self.assertTrue(
+            {"source-a", "source-b"}.issubset(
+                {edge["source_object_id"] for edge in provenance["incoming"]}
+            )
+        )
+
+    def test_marker_with_actor_suffix_is_parsed_and_removed(self) -> None:
+        self.manager.ingest_messages(
+            "marker-chat",
+            [{"id": "marker-event", "role": "assistant", "content": "Option C was proposed."}],
+            auto_capture=False,
+        )
+        result = self.manager.validate_response_attribution(
+            content="I previously proposed Option C.[[event:marker-event@unknown]]",
+            event_ids=["marker-event"],
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertNotIn("@unknown", result["safe_content"])
+        self.assertNotIn("[[event:", result["safe_content"])
+
+    def test_nightly_slm_extracts_structure_but_provenance_stays_deterministic(self) -> None:
+        self.manager.ingest_messages(
+            "nightly-chat",
+            [{"id": "nightly-source", "role": "user", "content": "炭酸は少し弱めにした。"}],
+            auto_capture=False,
+        )
+        response = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "source_event_ids": ["nightly-source", "not-supplied"],
+                        "memory_type": "procedural",
+                        "summary": "ユーザーは炭酸を少し弱めにする調整を試した可能性がある。",
+                        "keywords": ["炭酸", "調整"],
+                        "confidence": 0.64,
+                        "reason": "reusable adjustment",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(self.manager, "chat_completion", return_value=response):
+            result = self.manager.run_nightly_extraction(
+                conversation_id="nightly-chat", limit=10
+            )
+
+        self.assertEqual(result["created"], 1)
+        trace = self.manager.get_memory_trace(result["trace_ids"][0])
+        self.assertEqual(trace["source_event_ids"], ["nightly-source"])
+        self.assertEqual(trace["extractor"], "slm_nightly_v1")
+        self.assertEqual(trace["epistemic_status"], "inferred")
+
+    def test_slm_claim_extraction_does_not_decide_actor_validity(self) -> None:
+        self.manager.ingest_messages(
+            "claim-chat",
+            [{"id": "assistant-origin", "role": "assistant", "content": "AにはCの側面もある。"}],
+            auto_capture=False,
+        )
+        structured = json.dumps(
+            {
+                "claims": [
+                    {
+                        "claimed_actor_role": "user",
+                        "claim_kind": "speech",
+                        "statement": "AにはCの側面もある",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        with patch.dict(os.environ, {"HIPPOCAMPUS_CLAIM_SLM_ENABLED": "1"}), patch.object(
+            self.manager, "chat_completion", return_value=structured
+        ):
+            result = self.manager.validate_response_attribution(
+                content="君の言葉だったはずの『AにはCの側面もある』を再検討する。",
+                conversation_id="claim-chat",
+            )
+
+        self.assertEqual(result["decision"], "reject")
+        self.assertEqual(result["claims"][0]["detection"], "slm_structure_v1")
+        self.assertEqual(result["claims"][0]["best_evidence"]["actor_role"], "assistant")
+
+    def test_temporal_gate_rejects_date_mismatch_and_past_reminder(self) -> None:
+        wrong_today = self.manager.validate_response_temporal(
+            content="今日は2026年8月16日です。",
+            as_of="2026-08-15T12:00:00+09:00",
+            timezone="Asia/Tokyo",
+        )
+        past_reminder = self.manager.validate_response_temporal(
+            content="2026年8月13日に買い物へ行くようリマインドします。",
+            as_of="2026-08-15T12:00:00+09:00",
+            timezone="Asia/Tokyo",
+        )
+        historical = self.manager.validate_response_temporal(
+            content="2026年8月13日に買い物へ行きました。",
+            as_of="2026-08-15T12:00:00+09:00",
+            timezone="Asia/Tokyo",
+        )
+
+        self.assertEqual(wrong_today["decision"], "reject")
+        self.assertEqual(past_reminder["decision"], "reject")
+        self.assertEqual(historical["decision"], "allow")
+
+    def test_supersession_marks_prospective_dependents_for_review(self) -> None:
+        old_trace = self.manager.create_memory_trace(
+            {"content": "Old schedule", "candidate_memory_type": "semantic", "event_time": "2026-08-01T00:00:00Z"}
+        )
+        new_trace = self.manager.create_memory_trace(
+            {"content": "Corrected schedule", "candidate_memory_type": "semantic", "event_time": "2026-08-10T00:00:00Z"}
+        )
+        old_memory = self.manager.consolidate_memory_trace(old_trace["id"])
+        new_memory = self.manager.consolidate_memory_trace(new_trace["id"])
+        dependent = self.manager.create_memory_trace(
+            {
+                "content": "Act on the old schedule tomorrow.",
+                "candidate_memory_type": "prospective",
+                "derived_from": [
+                    {"object_type": "memory", "object_id": old_memory["id"], "relation": "derived_from"}
+                ],
+            }
+        )
+
+        relation = self.manager.supersede_long_term_memory(
+            old_memory["id"], new_memory["id"], effective_at="2026-08-10T12:00:00Z"
+        )
+        reviewed = self.manager.get_memory_trace(dependent["id"])
+
+        self.assertIn(
+            {"object_type": "memory_trace", "object_id": dependent["id"]},
+            relation["dependent_review"],
+        )
+        self.assertEqual(reviewed["status"], "review")
+        self.assertEqual(reviewed["epistemic_status"], "disputed")
+
+    def test_forget_trace_keeps_terminal_audit_event(self) -> None:
+        trace = self.manager.create_memory_trace({"content": "Temporary candidate"})
+        result = self.manager.forget_memory_trace(trace["id"], reason="test_cleanup")
+
+        self.assertTrue(result["forgotten"])
+        with self.assertRaises(KeyError):
+            self.manager.get_memory_trace(trace["id"])
+        events = self.manager.list_audit_events(
+            object_type="memory_trace", object_id=trace["id"], include_payload=True
+        )
+        self.assertEqual(events[0]["event_type"], "memory_trace.forgotten")
+        self.assertTrue(self.manager.verify_audit()["valid"])
+
+
+if __name__ == "__main__":
+    unittest.main()

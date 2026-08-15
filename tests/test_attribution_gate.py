@@ -189,7 +189,9 @@ class AttributionGateTests(unittest.TestCase):
         self.manager.consolidate_memory_trace(trace["id"])
         context = self.manager.build_context("interpretive aspect C", char_budget=3500)
 
-        self.assertIn("event:event-assistant-c@assistant", context["memory_context"])
+        self.assertIn("event:event-assistant-c", context["memory_context"])
+        self.assertIn("actor=assistant", context["memory_context"])
+        self.assertNotIn("@assistant", context["memory_context"])
         self.assertIn("event-assistant-c", context["attribution_evidence"]["event_ids"])
 
 

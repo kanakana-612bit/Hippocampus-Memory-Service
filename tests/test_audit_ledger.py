@@ -56,7 +56,7 @@ class AuditLedgerTests(unittest.TestCase):
         self.assertEqual(raw["source_channel"], "test_client")
         self.assertEqual(trace["actor_role"], "system")
         self.assertEqual(trace["content_origin"], "summary")
-        self.assertEqual(trace["extractor"], "deterministic_phase2_v1")
+        self.assertEqual(trace["extractor"], "deterministic_phase2_v2")
         self.assertTrue(
             any(
                 edge["source_object_id"] == "audit-source-message"

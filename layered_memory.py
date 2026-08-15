@@ -106,6 +106,14 @@ PHASE_5_TABLES = {
     "audit_branch_adoptions",
     "audit_checkpoints",
 }
+HARDENING_SCHEMA_VERSION = 7
+HARDENING_TABLES = {
+    "ingest_requests",
+    "extraction_decisions",
+    "batch_jobs",
+    "claim_extraction_cache",
+    "gate_evaluations",
+}
 
 
 def utc_now() -> str:
@@ -325,6 +333,7 @@ class LayeredMemoryStore:
                 (PHASE_1_SCHEMA_VERSION, "separate short-term traces and canonical long-term memories", utc_now()),
             )
             self.migrate_phase5_schema(con)
+            self.migrate_hardening_schema(con)
             if own:
                 con.commit()
             return migrated
@@ -917,6 +926,112 @@ class LayeredMemoryStore:
                 utc_now(),
             ),
         )
+
+    def migrate_hardening_schema(self, con: sqlite3.Connection) -> None:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS ingest_requests (
+                idempotency_key TEXT PRIMARY KEY,
+                request_digest TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS extraction_decisions (
+                decision_id TEXT PRIMARY KEY,
+                source_event_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                reason TEXT NOT NULL,
+                trace_ids_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                UNIQUE(source_event_id, extractor, extractor_version)
+            );
+            CREATE TABLE IF NOT EXISTS batch_jobs (
+                job_id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                watermark TEXT,
+                request_digest TEXT NOT NULL,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS claim_extraction_cache (
+                cache_key TEXT PRIMARY KEY,
+                candidate_digest TEXT NOT NULL,
+                extractor TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                model TEXT,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS gate_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                gate_type TEXT NOT NULL,
+                candidate_digest TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                applicable INTEGER NOT NULL,
+                duration_ms REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_extraction_decisions_conversation
+                ON extraction_decisions(conversation_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_extraction_decisions_source
+                ON extraction_decisions(source_event_id, extractor_version);
+            CREATE INDEX IF NOT EXISTS idx_batch_jobs_type
+                ON batch_jobs(job_type, started_at);
+            CREATE INDEX IF NOT EXISTS idx_claim_cache_digest
+                ON claim_extraction_cache(candidate_digest, extractor_version);
+            CREATE INDEX IF NOT EXISTS idx_gate_evaluations_type
+                ON gate_evaluations(gate_type, created_at);
+            """
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, description, applied_at) VALUES (?,?,?)",
+            (
+                HARDENING_SCHEMA_VERSION,
+                "idempotent ingestion, extraction decisions, batch jobs, and claim cache",
+                utc_now(),
+            ),
+        )
+
+    def hardening_status(self) -> dict[str, Any]:
+        with self.connect() as con:
+            tables = {
+                str(row["name"])
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            migration = con.execute(
+                "SELECT version, description, applied_at FROM schema_migrations WHERE version=?",
+                (HARDENING_SCHEMA_VERSION,),
+            ).fetchone()
+            counts = {
+                table: int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in HARDENING_TABLES
+                if table in tables
+            }
+        missing = sorted(HARDENING_TABLES - tables)
+        return {
+            "phase": "hardening",
+            "complete": migration is not None and not missing,
+            "schema_version": HARDENING_SCHEMA_VERSION,
+            "migration": dict(migration) if migration is not None else None,
+            "missing_tables": missing,
+            "counts": counts,
+            "capabilities": {
+                "idempotent_ingestion": "ingest_requests" in tables,
+                "extraction_decision_ledger": "extraction_decisions" in tables,
+                "restartable_batch_jobs": "batch_jobs" in tables,
+                "claim_extraction_cache": "claim_extraction_cache" in tables,
+                "gate_metrics": "gate_evaluations" in tables,
+            },
+        }
 
     def ensure_phase5_ready(self) -> dict[str, Any]:
         anchor = self.security.read_anchor()
@@ -1926,6 +2041,36 @@ class LayeredMemoryStore:
                 )
         return self.get_trace(trace_id)
 
+    def forget_trace(self, trace_id: str, reason: str = "user_requested") -> dict[str, Any]:
+        with self.connect() as con:
+            trace = self.get_trace(trace_id, con=con)
+            if self.audit_enabled(con):
+                event = self.audit.append_object_event(
+                    con,
+                    event_type="memory_trace.forgotten",
+                    object_type="memory_trace",
+                    object_id=trace_id,
+                    actor_role="system",
+                    source_channel="memory_api",
+                    content_origin="derived",
+                    derivations=trace.get("derived_from") or [],
+                    event_time=utc_now(),
+                    received_at=utc_now(),
+                    integrity_tier="durable",
+                    payload={"reason": reason},
+                )
+                audit_event_id = event["event_id"]
+            else:
+                audit_event_id = None
+            con.execute("DELETE FROM memory_trace_fts WHERE trace_id=?", (trace_id,))
+            con.execute("DELETE FROM memory_traces WHERE id=?", (trace_id,))
+        return {
+            "forgotten": True,
+            "trace_id": trace_id,
+            "conversation_id": trace.get("conversation_id"),
+            "audit_event_id": audit_event_id,
+        }
+
     def recall_trace(self, trace_id: str) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         with self.connect() as con:
@@ -2578,11 +2723,88 @@ class LayeredMemoryStore:
                     integrity_tier="durable",
                     payload={"superseded_memory_id": memory_id},
                 )
+            dependent_review = self._mark_temporal_dependents_for_review(
+                con,
+                source_memory_id=memory_id,
+                effective_at=effective,
+            )
             return {
                 "effective_at": effective,
                 "superseded": self.get_memory(memory_id, con=con),
                 "replacement": self.get_memory(replacement_memory_id, con=con),
+                "dependent_review": dependent_review,
             }
+
+    def _mark_temporal_dependents_for_review(
+        self,
+        con: sqlite3.Connection,
+        *,
+        source_memory_id: str,
+        effective_at: str,
+    ) -> list[dict[str, str]]:
+        edges = con.execute(
+            """
+            SELECT DISTINCT target_object_type, target_object_id
+            FROM provenance_edges
+            WHERE source_object_type='memory' AND source_object_id=?
+            """,
+            (source_memory_id,),
+        ).fetchall()
+        reviewed: list[dict[str, str]] = []
+        now = utc_now()
+        derivation = [
+            {
+                "object_type": "memory",
+                "object_id": source_memory_id,
+                "relation": "reevaluation_trigger",
+            }
+        ]
+        for edge in edges:
+            object_type = str(edge["target_object_type"])
+            object_id = str(edge["target_object_id"])
+            if object_type == "memory_trace":
+                row = con.execute(
+                    "SELECT candidate_memory_type, status FROM memory_traces WHERE id=?",
+                    (object_id,),
+                ).fetchone()
+                if row is None or row["candidate_memory_type"] != "prospective" or row["status"] == "archived":
+                    continue
+                con.execute(
+                    "UPDATE memory_traces SET status='review', epistemic_status='disputed', updated_at=? WHERE id=?",
+                    (now, object_id),
+                )
+                self.index_trace(con, object_id)
+            elif object_type == "memory":
+                row = con.execute(
+                    "SELECT memory_type, archived FROM memories WHERE id=?",
+                    (object_id,),
+                ).fetchone()
+                if row is None or row["memory_type"] != "prospective" or bool(row["archived"]):
+                    continue
+                con.execute(
+                    "UPDATE memories SET epistemic_status='disputed', updated_at=? WHERE id=?",
+                    (now, object_id),
+                )
+                self.index_memory(con, object_id)
+            else:
+                continue
+            if self.audit_enabled(con):
+                self.audit.append_object_event(
+                    con,
+                    event_type=f"{object_type}.temporal_review_required",
+                    object_type=object_type,
+                    object_id=object_id,
+                    actor_role="system",
+                    source_channel="temporal_reconciliation",
+                    content_origin="derived",
+                    derivations=derivation,
+                    event_time=effective_at,
+                    received_at=now,
+                    integrity_tier="durable",
+                    payload={"superseded_memory_id": source_memory_id},
+                )
+            reviewed.append({"object_type": object_type, "object_id": object_id})
+        return reviewed
 
     def forget_legacy_memory(self, legacy_type: str, legacy_id: str, con: sqlite3.Connection) -> None:
         rows = con.execute(

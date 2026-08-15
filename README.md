@@ -162,7 +162,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8091/memory/ingest `
       {"id":"turn-17","role":"user","content":"次に監査設計を検討する必要がある。"}
     ],
     "auto_capture":true,
-    "capture_threshold":0.50
+    "capture_threshold":0.50,
+    "idempotency_key":"example-chat-turn-17"
   }'
 ```
 
@@ -171,6 +172,25 @@ event IDs prevent replayed turns from being recorded twice. Repeated matching
 messages reinforce an existing active trace and increase its occurrence and
 continuity scores. Set `auto_capture=false` when importing material that already
 has a separate extraction pipeline.
+
+The same key can instead be supplied with the `Idempotency-Key` HTTP header.
+Reusing a key with a different payload is rejected.
+
+## Nightly Reassessment
+
+The real-time extractor is followed by an optional SLM reassessment of raw user
+events. The SLM may only structure candidates; supplied source IDs are checked
+deterministically and every accepted result starts as an inferred short-term
+trace.
+
+```powershell
+python scripts/run_nightly_maintenance.py --since-hours 36 --auto-consolidate
+```
+
+Use `POST /memory/nightly/extract` for extraction only or
+`POST /memory/nightly/run` for extraction, decay/consolidation, and a signed
+checkpoint. `GET /status/nightly` reports recent jobs, decisions, gate latency,
+and trace/source edge mismatches.
 
 ## Initial Learning From OpenWebUI
 
@@ -417,13 +437,18 @@ forgetting, and privacy without describing deployment-specific integrations.
 - `POST /context/build`
 - `POST /attribution/validate`
 - `POST /response/candidates/select`
+- `POST /temporal/validate`
+- `GET /status/hardening`
+- `GET /status/nightly`
 - `POST /memory/traces`
 - `GET /memory/traces`
-- `GET/PATCH /memory/traces/{trace_id}`
+- `GET/PATCH/DELETE /memory/traces/{trace_id}`
 - `POST /memory/traces/{trace_id}/recall`
 - `POST /memory/traces/{trace_id}/review`
 - `POST /memory/traces/{trace_id}/consolidate`
 - `POST /memory/maintenance`
+- `POST /memory/nightly/extract`
+- `POST /memory/nightly/run`
 - `POST /memories/retrieve`
 - `GET /memories`
 - `GET /memories/{memory_id}/evidence`
@@ -449,8 +474,9 @@ code belongs on `Private`; runtime data belongs in neither branch.
 
 ## Status
 
-Memory-domain phases 1 through 5 and the response attribution gate are
-implemented. Existing
+Memory-domain phases 1 through 5, the two-stage extraction pipeline, request
+idempotency, response attribution gate, explicit-date temporal gate, and
+nightly runner are implemented. Existing
 episodic/project/persistent rows are projected into the canonical long-term
 table at startup while legacy routes remain available. Back up a real SQLite
 database before first migration.
@@ -461,9 +487,9 @@ Run the test suite with the service environment:
 python -m unittest discover -s tests -v
 ```
 
-The next steps are scheduled nightly consolidation, operational evaluation,
-administrative authorization, and a review UI. Embedding retrieval remains
-optional; keyword + FTS5 is the default.
+The next steps are broader operational evaluation, relative-time claim
+extraction, administrative authorization, and a review UI. Embedding retrieval
+remains optional; keyword + FTS5 is the default.
 
 ## License
 

@@ -52,9 +52,17 @@ ENGLISH_VERBS = (
     r"believed|thought|argued|suggested|proposed|decided|chose"
 )
 
-EVENT_MARKER = re.compile(r"\[\[event:([A-Za-z0-9_.:-]+)\]\]")
-MEMORY_MARKER = re.compile(r"\[\[memory:([A-Za-z0-9_.:-]+)\]\]")
-ANY_MARKER = re.compile(r"\[\[(?:event|memory):[A-Za-z0-9_.:-]+\]\]")
+MARKER_ID = r"[A-Za-z0-9_.:-]+"
+MARKER_ACTOR = r"[A-Za-z0-9_.:-]+"
+EVENT_MARKER = re.compile(
+    rf"\[\[event:({MARKER_ID})(?:@{MARKER_ACTOR})?\]\]"
+)
+MEMORY_MARKER = re.compile(
+    rf"\[\[memory:({MARKER_ID})(?:@{MARKER_ACTOR})?\]\]"
+)
+ANY_MARKER = re.compile(
+    rf"\[\[(?:event|memory):{MARKER_ID}(?:@{MARKER_ACTOR})?\]\]"
+)
 
 
 def utc_now() -> str:

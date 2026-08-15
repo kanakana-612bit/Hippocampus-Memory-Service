@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -10,7 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from automatic_memory import (
     content_fingerprint,
     term_similarity,
 )
+from attribution_gate import extract_claims
 from layered_memory import ClosingConnection, LayeredMemoryStore
 from temporal_memory import (
     duration_text,
@@ -33,6 +35,7 @@ from temporal_memory import (
     timezone_name,
     validate_window,
 )
+from temporal_gate import TemporalGate
 
 try:
     import yaml
@@ -226,6 +229,7 @@ class MemoryManager:
         self.llm_model = os.getenv("HIPPOCAMPUS_LLM_MODEL", DEFAULT_LLM_MODEL)
         self.default_timezone = timezone_name(os.getenv("HIPPOCAMPUS_TIMEZONE", "UTC"))
         self.layered = LayeredMemoryStore(self.db_path)
+        self.temporal_gate = TemporalGate()
         self.init_db()
 
     def connect(self) -> sqlite3.Connection:
@@ -687,10 +691,38 @@ class MemoryManager:
         auto_capture: bool = True,
         capture_threshold: float = DEFAULT_CAPTURE_THRESHOLD,
         default_timezone: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         started_monotonic = time.monotonic()
         threshold = clamp(capture_threshold)
         batch_timezone = timezone_name(default_timezone or self.default_timezone)
+        request_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "conversation_id": conversation_id,
+                    "messages": messages,
+                    "auto_capture": bool(auto_capture),
+                    "capture_threshold": threshold,
+                    "default_timezone": batch_timezone,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        if idempotency_key:
+            with self.connect() as con:
+                cached = con.execute(
+                    "SELECT request_digest, response_json FROM ingest_requests WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+            if cached is not None:
+                if str(cached["request_digest"]) != request_digest:
+                    raise ValueError("Idempotency key was already used for a different ingest request.")
+                response = loads(cached["response_json"], {})
+                response["idempotent_replay"] = True
+                return response
         normalized_messages: list[dict[str, Any]] = []
         existing_message_ids: set[str] = set()
         existing_messages: dict[str, dict[str, Any]] = {}
@@ -919,7 +951,7 @@ class MemoryManager:
                 capture_threshold=threshold,
             )
 
-        return {
+        response = {
             "raw_messages": [message["id"] for message in normalized_messages],
             "persistent_memories": unique_list(persistent),
             "memory_traces": capture["trace_ids"],
@@ -936,6 +968,75 @@ class MemoryManager:
                 "duration_clock": "monotonic",
             },
         }
+        self.record_extraction_decisions(
+            conversation_id=conversation_id,
+            messages=normalized_messages,
+            capture=capture,
+            explicit_message_ids=explicit_message_ids,
+            auto_capture=auto_capture,
+        )
+        if idempotency_key:
+            with self.connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO ingest_requests
+                    (idempotency_key, request_digest, response_json, created_at)
+                    VALUES (?,?,?,?)
+                    """,
+                    (idempotency_key, request_digest, dumps(response), utc_now()),
+                )
+        response["idempotent_replay"] = False
+        return response
+
+    def record_extraction_decisions(
+        self,
+        *,
+        conversation_id: str,
+        messages: list[dict[str, Any]],
+        capture: dict[str, Any],
+        explicit_message_ids: set[str],
+        auto_capture: bool,
+    ) -> None:
+        details = {
+            str(item.get("message_id")): item
+            for item in capture.get("details") or []
+            if item.get("message_id")
+        }
+        now = utc_now()
+        with self.connect() as con:
+            for message in messages:
+                if message.get("role") != "user":
+                    continue
+                source_event_id = str(message["id"])
+                detail = details.get(source_event_id, {})
+                if source_event_id in explicit_message_ids:
+                    decision, reason = "explicit", "explicit_memory_route"
+                elif not auto_capture:
+                    decision, reason = "deferred", "automatic_capture_disabled"
+                else:
+                    decision = str(detail.get("action") or "deferred")
+                    reason = str(detail.get("reason") or ",".join(detail.get("reasons") or []) or decision)
+                trace_ids = [str(detail["trace_id"])] if detail.get("trace_id") else []
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO extraction_decisions
+                    (decision_id, source_event_id, conversation_id, extractor,
+                     extractor_version, decision, score, reason, trace_ids_json, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        new_id("decision"),
+                        source_event_id,
+                        conversation_id,
+                        "deterministic",
+                        "phase2_v2",
+                        decision,
+                        float(detail.get("capture_score") or 0.0),
+                        reason,
+                        dumps(trace_ids),
+                        now,
+                    ),
+                )
 
     def capture_automatic_memories(
         self,
@@ -1168,7 +1269,7 @@ class MemoryManager:
                     "actor_role": message.get("actor_role") or "user",
                     "source_channel": message.get("source_channel") or "api",
                     "content_origin": "summary",
-                    "extractor": "deterministic_phase2_v1",
+                    "extractor": "deterministic_phase2_v2",
                     "temporal_extractor": "deterministic_phase3_v1" if temporal_hint else None,
                     "temporal_expression": temporal_hint.get("temporal_expression"),
                     "temporal_precision": temporal_hint.get("temporal_precision"),
@@ -1177,7 +1278,7 @@ class MemoryManager:
                 "actor_role": "system",
                 "source_channel": "automatic_capture",
                 "content_origin": "summary",
-                "extractor": "deterministic_phase2_v1",
+                "extractor": "deterministic_phase2_v2",
                 "derived_from": [
                     {
                         "object_type": "raw_message",
@@ -1205,6 +1306,18 @@ class MemoryManager:
         )
         reasons = unique_list(trace.get("extraction_reasons") or [], analysis.get("reasons") or [], ["repetition"])
         repetition = max(float(trace.get("repetition_score", 0.0)), float(analysis.get("repetition_score", 0.0)), 0.62)
+        merged_source_ids = unique_list(trace.get("source_event_ids") or [], source_event_ids)
+        merged_derivations = unique_list(
+            trace.get("derived_from") or [],
+            [
+                {
+                    "object_type": "raw_message",
+                    "object_id": source_event_id,
+                    "relation": "summarized_from",
+                }
+                for source_event_id in merged_source_ids
+            ],
+        )
         return self.patch_memory_trace(
             trace["id"],
             {
@@ -1220,10 +1333,267 @@ class MemoryManager:
                 "occurrence_count": int(trace.get("occurrence_count", 1)) + 1,
                 "extraction_reasons": reasons,
                 "last_observed_at": observed_at,
-                "source_event_ids": unique_list(trace.get("source_event_ids") or [], source_event_ids),
+                "source_event_ids": merged_source_ids,
+                "derived_from": merged_derivations,
                 "evidence_summary": "Automatic candidate reinforced; signals: " + ", ".join(reasons),
             },
         )
+
+    def run_nightly_extraction(
+        self,
+        *,
+        conversation_id: str | None = None,
+        since: str | None = None,
+        limit: int = 120,
+        model: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        started_at = utc_now()
+        selected_model = model or self.llm_model
+        filters = ["raw.role='user'", "decision.decision_id IS NULL"]
+        params: list[Any] = ["slm", "nightly_v1"]
+        if conversation_id:
+            filters.append("raw.conversation_id=?")
+            params.append(conversation_id)
+        if since:
+            filters.append("raw.event_time>=?")
+            params.append(normalize_timestamp(since, self.default_timezone, field_name="since"))
+        params.append(max(1, min(int(limit), 500)))
+        with self.connect() as con:
+            active = con.execute(
+                """
+                SELECT job_id FROM batch_jobs
+                WHERE job_type='nightly_memory_extraction' AND status='running'
+                  AND started_at>=?
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                ((datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(timespec="milliseconds"),),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError(f"Nightly extraction is already running: {active['job_id']}")
+            rows = con.execute(
+                f"""
+                SELECT raw.*
+                FROM raw_messages AS raw
+                LEFT JOIN extraction_decisions AS decision
+                  ON decision.source_event_id=raw.id
+                 AND decision.extractor=?
+                 AND decision.extractor_version=?
+                WHERE {' AND '.join(filters)}
+                ORDER BY raw.event_time, raw.event_sequence, raw.created_at
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        source_events = [dict(row) for row in rows]
+        request_digest = hashlib.sha256(
+            dumps(
+                {
+                    "source_event_ids": [row["id"] for row in source_events],
+                    "model": selected_model,
+                    "extractor_version": "nightly_v1",
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        job_id = new_id("batch")
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO batch_jobs
+                (job_id, job_type, status, watermark, request_digest, result_json, started_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (job_id, "nightly_memory_extraction", "running", since, request_digest, "{}", started_at),
+            )
+        if not source_events:
+            result = {
+                "job_id": job_id,
+                "status": "completed",
+                "examined": 0,
+                "created": 0,
+                "trace_ids": [],
+                "dry_run": dry_run,
+            }
+            self._finish_batch_job(job_id, result)
+            return result
+
+        event_ids = {str(row["id"]) for row in source_events}
+        transcript = "\n".join(
+            f"[{row['id']}] {row.get('event_time') or row.get('created_at')} "
+            f"actor={row.get('actor_role') or row.get('role')} content={str(row.get('content') or '')[:1200]}"
+            for row in source_events
+        )
+        prompt = (
+            "You are the second-stage extractor for a local long-term memory service. "
+            "Review user source events that the real-time rules did not necessarily retain. "
+            "Extract only durable preferences, plans, corrections, emotionally salient experiences, "
+            "or reusable procedures. Never change who said something. Output JSON only with this shape: "
+            '{"candidates":[{"source_event_ids":["id"],"memory_type":"episodic|semantic|prospective|procedural|embodied",'
+            '"summary":"tentative summary","keywords":["term"],"confidence":0.0,"reason":"brief reason"}]}. '
+            "Use only supplied IDs. Omit ordinary small talk. Keep inferred summaries tentative.\n\n"
+            + transcript
+        )
+        try:
+            raw_response = self.chat_completion(
+                model=selected_model,
+                messages=[
+                    {"role": "system", "content": "Extract structured memory candidates. Output valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=2600,
+                timeout=int(os.getenv("HIPPOCAMPUS_SLM_TIMEOUT_SECONDS", "180")),
+            )
+            payload = self.parse_json_object(raw_response)
+            candidates = payload.get("candidates") or []
+            if not isinstance(candidates, list):
+                raise ValueError("SLM candidates must be a list.")
+            created: list[str] = []
+            accepted_sources: dict[str, list[str]] = {}
+            for item in candidates[:80]:
+                if not isinstance(item, dict):
+                    continue
+                source_ids = unique_list(
+                    [str(value) for value in item.get("source_event_ids") or [] if str(value) in event_ids]
+                )
+                memory_type = str(item.get("memory_type") or "semantic")
+                summary = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()
+                if not source_ids or memory_type not in {"episodic", "semantic", "prospective", "procedural", "embodied"}:
+                    continue
+                if len(summary) < 4:
+                    continue
+                source = next(row for row in source_events if str(row["id"]) == source_ids[0])
+                trace_id = ""
+                if not dry_run:
+                    trace = self.create_memory_trace(
+                        {
+                            "conversation_id": source.get("conversation_id"),
+                            "turn_id": source_ids[-1],
+                            "trace_stage": "candidate",
+                            "candidate_memory_type": memory_type,
+                            "title": summary[:80],
+                            "content": summary,
+                            "keywords": item.get("keywords") or query_terms(summary),
+                            "acquisition_mode": "automatic",
+                            "epistemic_status": "inferred",
+                            "epistemic_confidence": min(0.85, clamp(item.get("confidence", 0.58))),
+                            "activation": 0.58,
+                            "salience": 0.62,
+                            "stability": 0.12,
+                            "capture_score": 0.62,
+                            "extraction_reasons": ["nightly_slm_reassessment", str(item.get("reason") or "durable_signal")],
+                            "content_fingerprint": content_fingerprint(summary),
+                            "observed_at": source.get("event_time") or source.get("created_at"),
+                            "event_time": source.get("event_time") or source.get("created_at"),
+                            "received_at": source.get("received_at") or source.get("created_at"),
+                            "persisted_at": utc_now(),
+                            "source_time": source.get("source_time") or source.get("event_time"),
+                            "timezone": source.get("timezone") or self.default_timezone,
+                            "time_source": source.get("time_source") or "source_event",
+                            "evidence_summary": "Nightly SLM candidate extraction; deterministic provenance validation applied.",
+                            "source_event_ids": source_ids,
+                            "source": {
+                                "conversation_id": source.get("conversation_id"),
+                                "extractor": "slm_nightly_v1",
+                                "model": selected_model,
+                            },
+                            "actor_role": "system",
+                            "source_channel": "nightly_extraction",
+                            "content_origin": "summary",
+                            "extractor": "slm_nightly_v1",
+                            "derived_from": [
+                                {"object_type": "raw_message", "object_id": value, "relation": "summarized_from"}
+                                for value in source_ids
+                            ],
+                        }
+                    )
+                    trace_id = str(trace["id"])
+                    created.append(trace_id)
+                for source_id in source_ids:
+                    accepted_sources.setdefault(source_id, []).append(trace_id or "dry_run")
+
+            if not dry_run:
+                now = utc_now()
+                with self.connect() as con:
+                    for row in source_events:
+                        source_id = str(row["id"])
+                        trace_ids = accepted_sources.get(source_id, [])
+                        con.execute(
+                            """
+                            INSERT OR IGNORE INTO extraction_decisions
+                            (decision_id, source_event_id, conversation_id, extractor,
+                             extractor_version, decision, score, reason, trace_ids_json, created_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                new_id("decision"), source_id, row["conversation_id"], "slm", "nightly_v1",
+                                "created" if trace_ids else "skipped", 0.62 if trace_ids else 0.0,
+                                "nightly_slm_reassessment", dumps(trace_ids), now,
+                            ),
+                        )
+            result = {
+                "job_id": job_id,
+                "status": "completed",
+                "examined": len(source_events),
+                "candidate_count": len(candidates),
+                "created": len(created),
+                "trace_ids": created,
+                "dry_run": dry_run,
+                "model": selected_model,
+            }
+            self._finish_batch_job(job_id, result)
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            with self.connect() as con:
+                con.execute(
+                    "UPDATE batch_jobs SET status='failed', completed_at=?, error=? WHERE job_id=?",
+                    (utc_now(), error, job_id),
+                )
+            raise RuntimeError(f"Nightly extraction failed: {error}") from exc
+
+    def _finish_batch_job(self, job_id: str, result: dict[str, Any]) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE batch_jobs SET status='completed', result_json=?, completed_at=? WHERE job_id=?",
+                (dumps(result), utc_now(), job_id),
+            )
+
+    def run_nightly_cycle(
+        self,
+        *,
+        since_hours: int = 36,
+        conversation_id: str | None = None,
+        limit: int = 120,
+        model: str | None = None,
+        auto_consolidate: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        since = (datetime.now(timezone.utc) - timedelta(hours=max(1, since_hours))).isoformat(
+            timespec="milliseconds"
+        )
+        extraction = self.run_nightly_extraction(
+            conversation_id=conversation_id,
+            since=since,
+            limit=limit,
+            model=model,
+            dry_run=dry_run,
+        )
+        if dry_run:
+            return {"status": "completed", "dry_run": True, "extraction": extraction}
+        maintenance = self.maintain_memory_layers(
+            as_of=utc_now(),
+            auto_consolidate=auto_consolidate,
+            archive_below_threshold=True,
+        )
+        checkpoint = self.create_signed_checkpoint(reason="nightly_cycle")
+        return {
+            "status": "completed",
+            "dry_run": False,
+            "extraction": extraction,
+            "maintenance": maintenance,
+            "checkpoint": checkpoint,
+        }
 
     def load_openwebui_chat(
         self,
@@ -2145,11 +2515,7 @@ class MemoryManager:
         )
         references = (evidence_by_memory or {}).get(str(memory.get("id") or ""), [])
         reference_text = ",".join(
-            (
-                f"event:{item['reference_id']}@{item['actor_role']}"
-                if item["reference_type"] == "event"
-                else f"memory:{item['reference_id']}@{item['actor_role']}"
-            )
+            f"{item['reference_type']}:{item['reference_id']}(actor={item['actor_role']})"
             for item in references[:6]
         )
         source_text = f"; sources={reference_text}" if reference_text else ""
@@ -2628,6 +2994,9 @@ class MemoryManager:
     def patch_memory_trace(self, trace_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         return self.layered.patch_trace(trace_id, patch)
 
+    def forget_memory_trace(self, trace_id: str, reason: str = "user_requested") -> dict[str, Any]:
+        return self.layered.forget_trace(trace_id, reason=reason)
+
     def recall_memory_trace(self, trace_id: str) -> dict[str, Any]:
         return self.layered.recall_trace(trace_id)
 
@@ -2787,6 +3156,9 @@ class MemoryManager:
     def phase5_status(self) -> dict[str, Any]:
         return self.layered.phase5_status()
 
+    def hardening_status(self) -> dict[str, Any]:
+        return self.layered.hardening_status()
+
     def create_signed_checkpoint(self, reason: str = "manual") -> dict[str, Any]:
         return self.layered.create_signed_checkpoint(reason=reason)
 
@@ -2827,12 +3199,15 @@ class MemoryManager:
         claims: list[dict[str, Any]] | None = None,
         threshold: float = 0.46,
     ) -> dict[str, Any]:
+        structured_claims = claims
+        if structured_claims is None:
+            structured_claims = self.extract_attribution_claims(content)
         return self.layered.validate_response_attribution(
             content=content,
             conversation_id=conversation_id,
             event_ids=event_ids,
             memory_ids=memory_ids,
-            claims=claims,
+            claims=structured_claims,
             threshold=threshold,
         )
 
@@ -2844,13 +3219,286 @@ class MemoryManager:
         event_ids: list[str] | None = None,
         memory_ids: list[str] | None = None,
         threshold: float = 0.46,
+        validate_temporal: bool = True,
+        as_of: str | None = None,
+        timezone: str | None = None,
     ) -> dict[str, Any]:
-        return self.layered.select_response_candidate(
-            candidates=candidates,
-            conversation_id=conversation_id,
-            event_ids=event_ids,
-            memory_ids=memory_ids,
-            threshold=threshold,
+        evaluated: list[dict[str, Any]] = []
+        zone = timezone_name(timezone or self.default_timezone)
+        for index, candidate in enumerate(candidates[:12]):
+            item = dict(candidate)
+            if item.get("claims") is None:
+                item["claims"] = self.extract_attribution_claims(str(item.get("content") or ""))
+            content = str(item.get("content") or "")
+            gate_started = time.monotonic()
+            attribution = self.layered.validate_response_attribution(
+                content=content,
+                conversation_id=conversation_id,
+                event_ids=event_ids,
+                memory_ids=memory_ids,
+                claims=item.get("claims"),
+                threshold=threshold,
+            )
+            self._record_gate_metric(
+                "attribution",
+                attribution,
+                (time.monotonic() - gate_started) * 1000.0,
+            )
+            temporal_started = time.monotonic()
+            temporal = self.temporal_gate.validate_candidate(
+                content=content,
+                as_of=as_of,
+                timezone_name=zone,
+            ) if validate_temporal else {
+                "decision": "allow",
+                "applicable": False,
+                "claim_counts": {"verified": 0, "unverified": 0, "contradicted": 0},
+                "claims": [],
+            }
+            if validate_temporal:
+                self._record_gate_metric(
+                    "temporal",
+                    temporal,
+                    (time.monotonic() - temporal_started) * 1000.0,
+                )
+            quality = float(item.get("quality_score") or 0.0)
+            allowed = attribution["decision"] == "allow" and temporal["decision"] == "allow"
+            rank = (
+                1 if allowed else 0,
+                attribution["claim_counts"]["verified"] + temporal["claim_counts"]["verified"],
+                -attribution["claim_counts"]["unverified"],
+                quality,
+                -index,
+            )
+            evaluated.append(
+                {
+                    "candidate_id": str(item.get("candidate_id") or f"candidate_{index + 1}"),
+                    "quality_score": quality,
+                    "validation": attribution,
+                    "temporal_validation": temporal,
+                    "allowed": allowed,
+                    "rank": list(rank),
+                }
+            )
+        allowed_candidates = [item for item in evaluated if item["allowed"]]
+        selected = max(allowed_candidates, key=lambda item: tuple(item["rank"])) if allowed_candidates else None
+        feedback: list[dict[str, Any]] = []
+        if selected is None:
+            for item in evaluated:
+                for claim in item["validation"]["claims"]:
+                    if claim["status"] != "verified":
+                        feedback.append(
+                            {
+                                "gate": "attribution",
+                                "candidate_id": item["candidate_id"],
+                                "status": claim["status"],
+                                "reason": claim["reason"],
+                                "claimed_actor_role": claim.get("claimed_actor_role"),
+                            }
+                        )
+                for claim in item["temporal_validation"]["claims"]:
+                    if claim["status"] == "contradicted":
+                        feedback.append(
+                            {
+                                "gate": "temporal",
+                                "candidate_id": item["candidate_id"],
+                                "status": claim["status"],
+                                "reason": claim["reason"],
+                                "expression": claim.get("expression"),
+                                "resolved_date": claim.get("resolved_date"),
+                            }
+                        )
+        return {
+            "format": "hippocampus.response-gates.v1",
+            "decision": "selected" if selected else "regenerate",
+            "selected_candidate_id": selected["candidate_id"] if selected else None,
+            "selected_content": selected["validation"]["safe_content"] if selected else None,
+            "regeneration_required": selected is None,
+            "regeneration_feedback": feedback[:16],
+            "fallback_content": (
+                "過去の発言者または時間関係を根拠から確認できなかったため、応答を再生成します。"
+                if selected is None else None
+            ),
+            "candidates": evaluated,
+        }
+
+    def validate_response_temporal(
+        self,
+        *,
+        content: str,
+        as_of: str | None = None,
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        return self.temporal_gate.validate_candidate(
+            content=content,
+            as_of=as_of,
+            timezone_name=timezone_name(timezone or self.default_timezone),
+        )
+
+    def _record_gate_metric(
+        self,
+        gate_type: str,
+        result: dict[str, Any],
+        duration_ms: float,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO gate_evaluations
+                (evaluation_id, gate_type, candidate_digest, decision, applicable, duration_ms, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    new_id("gate"), gate_type, str(result.get("candidate_digest") or ""),
+                    str(result.get("decision") or "unknown"), int(bool(result.get("applicable"))),
+                    round(float(duration_ms), 3), utc_now(),
+                ),
+            )
+
+    def nightly_status(self) -> dict[str, Any]:
+        with self.connect() as con:
+            jobs = [
+                dict(row)
+                for row in con.execute(
+                    "SELECT * FROM batch_jobs ORDER BY started_at DESC LIMIT 20"
+                ).fetchall()
+            ]
+            decisions = {
+                f"{row['extractor']}:{row['decision']}": int(row["count"])
+                for row in con.execute(
+                    """
+                    SELECT extractor, decision, count(*) AS count
+                    FROM extraction_decisions GROUP BY extractor, decision
+                    """
+                ).fetchall()
+            }
+            gates = [
+                dict(row)
+                for row in con.execute(
+                    """
+                    SELECT gate_type, decision, count(*) AS count,
+                           round(avg(duration_ms), 3) AS average_duration_ms
+                    FROM gate_evaluations GROUP BY gate_type, decision
+                    ORDER BY gate_type, decision
+                    """
+                ).fetchall()
+            ]
+            mismatches = 0
+            for row in con.execute(
+                "SELECT id, source_event_ids_json FROM memory_traces"
+            ).fetchall():
+                sources = set(loads(row["source_event_ids_json"], []))
+                edges = {
+                    str(edge["source_object_id"])
+                    for edge in con.execute(
+                        """
+                        SELECT source_object_id FROM provenance_edges
+                        WHERE target_object_type='memory_trace' AND target_object_id=?
+                          AND source_object_type='raw_message'
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                }
+                if not sources.issubset(edges):
+                    mismatches += 1
+        return {
+            "complete": self.hardening_status()["complete"],
+            "recent_jobs": jobs,
+            "extraction_decisions": decisions,
+            "gate_metrics": gates,
+            "provenance_trace_mismatches": mismatches,
+        }
+
+    def extract_attribution_claims(self, content: str) -> list[dict[str, Any]]:
+        deterministic = extract_claims(content)
+        if deterministic:
+            return deterministic
+        if not self._attribution_risk(content):
+            return []
+        if str(os.getenv("HIPPOCAMPUS_CLAIM_SLM_ENABLED", "0")).strip().lower() not in {
+            "1", "true", "yes", "on", "enabled"
+        }:
+            return []
+
+        model = os.getenv("HIPPOCAMPUS_CLAIM_SLM_MODEL") or self.llm_model
+        candidate_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(
+            f"claim_slm_v1\0{model}\0{candidate_digest}".encode("utf-8")
+        ).hexdigest()
+        with self.connect() as con:
+            cached = con.execute(
+                "SELECT response_json FROM claim_extraction_cache WHERE cache_key=?",
+                (cache_key,),
+            ).fetchone()
+        if cached is not None:
+            return loads(cached["response_json"], [])
+
+        prompt = (
+            "Extract only claims that attribute a past statement, request, preference, belief, "
+            "or proposal to user, assistant, or system. Do not judge whether a claim is true. "
+            "Output JSON only as {\"claims\":[{\"claimed_actor_role\":\"user|assistant|system\","
+            "\"claim_kind\":\"speech|request|preference|belief|proposal\","
+            "\"statement\":\"attributed proposition\",\"event_ids\":[],\"memory_ids\":[]}]}. "
+            "Return an empty claims list when there is no attribution claim. Preserve any exact "
+            "event or memory IDs appearing in [[event:ID]] or [[memory:ID]] markers.\n\n"
+            f"Candidate response:\n{content}"
+        )
+        raw = self.chat_completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Extract attribution claims as JSON. Never validate them."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1200,
+            timeout=int(os.getenv("HIPPOCAMPUS_CLAIM_SLM_TIMEOUT_SECONDS", "90")),
+        )
+        payload = self.parse_json_object(raw)
+        claims: list[dict[str, Any]] = []
+        for index, claim in enumerate(payload.get("claims") or []):
+            if not isinstance(claim, dict):
+                continue
+            actor = str(claim.get("claimed_actor_role") or "")
+            kind = str(claim.get("claim_kind") or "speech")
+            statement = re.sub(r"\s+", " ", str(claim.get("statement") or "")).strip()
+            if actor not in {"user", "assistant", "system"} or kind not in {
+                "speech", "request", "preference", "belief", "proposal"
+            } or not statement:
+                continue
+            claims.append(
+                {
+                    "claim_id": str(claim.get("claim_id") or f"slm_claim_{index + 1}"),
+                    "sentence": str(claim.get("sentence") or statement),
+                    "claimed_actor_role": actor,
+                    "claim_kind": kind,
+                    "statement": statement,
+                    "event_ids": [str(value) for value in claim.get("event_ids") or []],
+                    "memory_ids": [str(value) for value in claim.get("memory_ids") or []],
+                    "detection": "slm_structure_v1",
+                }
+            )
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO claim_extraction_cache
+                (cache_key, candidate_digest, extractor, extractor_version, model, response_json, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (cache_key, candidate_digest, "slm", "claim_v1", model, dumps(claims), utc_now()),
+            )
+        return claims
+
+    @staticmethod
+    def _attribution_risk(content: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:君|あなた|ユーザー|私|僕|アシスタント|AI).{0,100}"
+                r"(?:言|話|述|頼|求|望|好|嫌|考|提案|主張|決め|選)|"
+                r"(?:you|user|I|assistant).{0,100}"
+                r"(?:said|told|asked|requested|wanted|preferred|believed|suggested|decided)",
+                content,
+                flags=re.I | re.S,
+            )
         )
 
     def attribution_gate_status(self) -> dict[str, Any]:

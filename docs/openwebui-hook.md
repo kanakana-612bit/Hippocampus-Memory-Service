@@ -53,6 +53,7 @@ HIPPOCAMPUS_ATTRIBUTION_GATE_ENABLED=1
 HIPPOCAMPUS_ATTRIBUTION_GATE_MODE=risk_based
 HIPPOCAMPUS_ATTRIBUTION_TIMEOUT_SECONDS=5.0
 HIPPOCAMPUS_ATTRIBUTION_GATE_FAIL_CLOSED=1
+HIPPOCAMPUS_TEMPORAL_GATE_ENABLED=1
 ```
 
 `HIPPOCAMPUS_ATTRIBUTION_GATE_MODE` accepts `risk_based`, `always`, or `off`.
@@ -84,7 +85,8 @@ Example ingestion payload:
       "content_origin": "original"
     }
   ],
-  "auto_capture": true
+  "auto_capture": true,
+  "idempotency_key": "stable-request-key"
 }
 ```
 
@@ -108,7 +110,7 @@ something. These markers are machine-readable evidence references and are
 removed before the final response is displayed.
 
 For a gated response, the OpenWebUI integration buffers the draft and calls
-`POST /response/candidates/select`. Hippocampus checks only actor attribution:
+`POST /response/candidates/select`. Hippocampus applies two narrow checks:
 
 - a matching audited original event can verify a direct speech claim;
 - a confirmed explicit memory can support a request, preference, belief, or
@@ -116,6 +118,10 @@ For a gated response, the OpenWebUI integration buffers the draft and calls
 - assistant-authored or derived evidence cannot be presented as a user-authored
   statement;
 - missing or weak evidence remains `unverified`.
+- explicit date claims are checked against the configured current time and
+  timezone;
+- a past date cannot be presented as a pending future reminder, while a
+  correctly worded historical event remains allowed.
 
 If the first candidate is contradicted or unverified, OpenWebUI requests one
 regeneration with narrow correction feedback and validates it again. If the
@@ -123,10 +129,12 @@ retry still fails, it displays a neutral fallback rather than the rejected
 draft. `HIPPOCAMPUS_ATTRIBUTION_GATE_FAIL_CLOSED=1` applies the same behavior
 when the validator itself is unavailable during a gated response.
 
-The gate is not a factuality checker and does not review the whole answer. It
-only decides whether a response may assign a remembered proposition to the
-claimed actor. This narrow scope keeps the check deterministic and allows the
-Phase 4 and Phase 5 evidence to be reused directly.
+The gates are not general factuality checkers and do not review the whole
+answer. They only check actor attribution and explicit temporal consistency.
+This narrow scope keeps the final decision deterministic and allows Phase 4
+and Phase 5 evidence to be reused directly. Optional SLM claim extraction is
+enabled in the Hippocampus service with `HIPPOCAMPUS_CLAIM_SLM_ENABLED=1`; the
+SLM structures claims but never decides whether they are valid.
 
 When the frontend has an original timestamp, send it as `event_time` together
 with its IANA `timezone`. If it does not, omit it; Hippocampus records the value
