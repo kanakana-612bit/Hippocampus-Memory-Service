@@ -19,6 +19,11 @@ def main() -> int:
     parser.add_argument("--conversation-id")
     parser.add_argument("--limit", type=int, default=120)
     parser.add_argument("--model")
+    parser.add_argument("--session-gap-minutes", type=int, default=90)
+    parser.add_argument("--context-tokens", type=int, default=12000)
+    parser.add_argument("--overlap-turns", type=int, default=2)
+    parser.add_argument("--topic-boundary-threshold", type=float, default=0.68)
+    parser.add_argument("--no-boundary-slm", action="store_true")
     parser.add_argument("--auto-consolidate", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -32,6 +37,11 @@ def main() -> int:
             model=args.model,
             auto_consolidate=args.auto_consolidate,
             dry_run=args.dry_run,
+            session_gap_minutes=args.session_gap_minutes,
+            context_tokens=args.context_tokens,
+            overlap_turns=args.overlap_turns,
+            topic_boundary_threshold=args.topic_boundary_threshold,
+            use_boundary_slm=not args.no_boundary_slm,
         )
     except Exception as exc:
         print(json.dumps({"status": "failed", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))

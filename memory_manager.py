@@ -23,6 +23,19 @@ from automatic_memory import (
     term_similarity,
 )
 from attribution_gate import extract_claims
+from conversation_segmentation import (
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_OVERLAP_TURNS,
+    DEFAULT_SESSION_GAP_MINUTES,
+    DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+    SEGMENTATION_VERSION,
+    deterministic_id,
+    deterministic_session_boundaries,
+    estimate_event_tokens,
+    explicit_topic_candidates,
+    split_events,
+    token_chunks,
+)
 from layered_memory import ClosingConnection, LayeredMemoryStore
 from slm_client import StructuredSLMClient
 from temporal_memory import (
@@ -1376,6 +1389,626 @@ class MemoryManager:
             },
         )
 
+    @staticmethod
+    def _topic_boundary_schema(allowed_after_ids: list[str]) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "boundaries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "after_event_id": {
+                                "type": "string",
+                                "enum": allowed_after_ids,
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "reason": {"type": "string"},
+                            "signals": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "previous_topic": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                            "next_topic": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                        },
+                        "required": [
+                            "after_event_id",
+                            "confidence",
+                            "reason",
+                            "signals",
+                            "previous_topic",
+                            "next_topic",
+                        ],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["boundaries"],
+            "additionalProperties": False,
+        }
+
+    def _slm_topic_boundaries(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        model: str,
+        context_tokens: int,
+        overlap_turns: int,
+        threshold: float,
+    ) -> tuple[list[dict[str, Any]], list[str], int]:
+        user_ids = [
+            str(event["id"])
+            for event in events
+            if str(event.get("actor_role") or event.get("role") or "").lower() == "user"
+        ]
+        if len(user_ids) < 2:
+            return [], [], 0
+        first_user_id = user_ids[0]
+        event_index = {str(event["id"]): index for index, event in enumerate(events)}
+        rule_candidates = {
+            str(item["after_event_id"]): item for item in explicit_topic_candidates(events)
+        }
+        boundaries_by_after: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+        model_calls = 0
+        for chunk in token_chunks(
+            events,
+            max_tokens=context_tokens,
+            overlap_turns=overlap_turns,
+        ):
+            chunk_events = chunk["events"]
+            allowed_after_ids = [
+                str(event["id"])
+                for event in chunk_events
+                if str(event["id"]) != first_user_id
+                and str(event.get("actor_role") or event.get("role") or "").lower() == "user"
+            ]
+            if not allowed_after_ids:
+                continue
+            candidate_notes = [
+                {
+                    "after_event_id": event_id,
+                    "signals": rule_candidates[event_id]["signals"],
+                }
+                for event_id in allowed_after_ids
+                if event_id in rule_candidates
+            ]
+            transcript = "\n".join(
+                f"[{event['id']}] {event.get('event_time') or event.get('created_at')} "
+                f"actor={event.get('actor_role') or event.get('role')} "
+                f"content={re.sub(r'\s+', ' ', str(event.get('content') or '')).strip()}"
+                for event in chunk_events
+            )
+            prompt = (
+                "Detect genuine topic boundaries in this ordered conversation excerpt. A boundary "
+                "starts at a user event whose topic is materially different from the preceding "
+                "exchange. Do not mark a boundary for elaboration, correction, summary, or a transition "
+                "word that still continues the same subject. Explicit transition expressions are only "
+                "candidates. Return only after_event_id values from the allowed list. Do not alter actor "
+                "or event attribution.\n\n"
+                f"Allowed after_event_id values: {dumps(allowed_after_ids)}\n"
+                f"Rule candidates: {dumps(candidate_notes)}\n\n{transcript}"
+            )
+            try:
+                model_calls += 1
+                raw = self.chat_completion(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a narrow conversation topic-boundary classifier. "
+                                "Return JSON matching the supplied schema."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1800,
+                    timeout=int(os.getenv("HIPPOCAMPUS_SLM_TIMEOUT_SECONDS", "180")),
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "hippocampus_topic_boundaries",
+                            "strict": True,
+                            "schema": self._topic_boundary_schema(allowed_after_ids),
+                        },
+                    },
+                )
+                payload = self.parse_json_object(raw)
+                items = payload.get("boundaries") or []
+                if not isinstance(items, list):
+                    raise ValueError("Topic boundary output must contain an array.")
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    after_event_id = str(item.get("after_event_id") or "")
+                    confidence = clamp(item.get("confidence", 0.0))
+                    if after_event_id not in allowed_after_ids or confidence < threshold:
+                        continue
+                    index = event_index[after_event_id]
+                    signals = unique_list(
+                        [str(value) for value in item.get("signals") or []],
+                        rule_candidates.get(after_event_id, {}).get("signals", []),
+                    )
+                    candidate = {
+                        "boundary_type": "topic",
+                        "before_event_id": str(events[index - 1]["id"]) if index else None,
+                        "after_event_id": after_event_id,
+                        "boundary_time": str(
+                            events[index].get("event_time")
+                            or events[index].get("created_at")
+                            or ""
+                        ),
+                        "detection_source": "slm",
+                        "confidence": confidence,
+                        "reason": re.sub(
+                            r"\s+", " ", str(item.get("reason") or "semantic_topic_shift")
+                        ).strip(),
+                        "signals": signals or ["semantic_shift"],
+                        "previous_topic": item.get("previous_topic"),
+                        "next_topic": item.get("next_topic"),
+                        "model": model,
+                    }
+                    previous = boundaries_by_after.get(after_event_id)
+                    if previous is None or confidence > float(previous["confidence"]):
+                        boundaries_by_after[after_event_id] = candidate
+            except Exception as exc:
+                warnings.append(f"{type(exc).__name__}: {exc}")
+                for after_event_id in allowed_after_ids:
+                    fallback = rule_candidates.get(after_event_id)
+                    if fallback is not None and after_event_id not in boundaries_by_after:
+                        boundaries_by_after[after_event_id] = {
+                            **fallback,
+                            "detection_source": "rule_fallback",
+                            "model": model,
+                        }
+        return list(boundaries_by_after.values()), warnings, model_calls
+
+    @staticmethod
+    def _segment_record(
+        *,
+        conversation_id: str,
+        segment_type: str,
+        events: list[dict[str, Any]],
+        parent_segment_id: str | None,
+        boundary_id: str | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "conversation_id": conversation_id,
+            "segment_type": segment_type,
+            "start_event_id": str(events[0]["id"]),
+            "end_event_id": str(events[-1]["id"]),
+            "segmentation_version": SEGMENTATION_VERSION,
+        }
+        return {
+            "segment_id": deterministic_id("segment", payload),
+            **payload,
+            "parent_segment_id": parent_segment_id,
+            "start_time": events[0].get("event_time") or events[0].get("created_at"),
+            "end_time": events[-1].get("event_time") or events[-1].get("created_at"),
+            "boundary_id": boundary_id,
+            "event_count": len(events),
+            "estimated_tokens": sum(estimate_event_tokens(event) for event in events),
+            "event_ids": [str(event["id"]) for event in events],
+        }
+
+    def _persist_segment_analysis(self, analysis: dict[str, Any]) -> None:
+        conversation_id = str(analysis["conversation_id"])
+        with self.connect() as con:
+            con.execute(
+                """
+                DELETE FROM conversation_segment_events
+                WHERE segment_id IN (
+                    SELECT segment_id FROM conversation_segments
+                    WHERE conversation_id=? AND segmentation_version=?
+                )
+                """,
+                (conversation_id, SEGMENTATION_VERSION),
+            )
+            con.execute(
+                "DELETE FROM conversation_segments WHERE conversation_id=? AND segmentation_version=?",
+                (conversation_id, SEGMENTATION_VERSION),
+            )
+            con.execute(
+                "DELETE FROM conversation_boundaries WHERE conversation_id=? AND segmentation_version=?",
+                (conversation_id, SEGMENTATION_VERSION),
+            )
+            now = utc_now()
+            for boundary in analysis["boundaries"]:
+                con.execute(
+                    """
+                    INSERT INTO conversation_boundaries
+                    (boundary_id, conversation_id, boundary_type, before_event_id,
+                     after_event_id, boundary_time, detection_source, confidence,
+                     reason, signals_json, previous_topic, next_topic, model,
+                     segmentation_version, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        boundary["boundary_id"], conversation_id, boundary["boundary_type"],
+                        boundary.get("before_event_id"), boundary["after_event_id"],
+                        boundary.get("boundary_time"), boundary["detection_source"],
+                        boundary["confidence"], boundary["reason"],
+                        dumps(boundary.get("signals") or []), boundary.get("previous_topic"),
+                        boundary.get("next_topic"), boundary.get("model"),
+                        SEGMENTATION_VERSION, now,
+                    ),
+                )
+            for segment in analysis["segments"]:
+                con.execute(
+                    """
+                    INSERT INTO conversation_segments
+                    (segment_id, conversation_id, segment_type, parent_segment_id,
+                     start_event_id, end_event_id, start_time, end_time, boundary_id,
+                     event_count, estimated_tokens, segmentation_version, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        segment["segment_id"], conversation_id, segment["segment_type"],
+                        segment.get("parent_segment_id"), segment["start_event_id"],
+                        segment["end_event_id"], segment.get("start_time"), segment.get("end_time"),
+                        segment.get("boundary_id"), segment["event_count"],
+                        segment["estimated_tokens"], SEGMENTATION_VERSION, now,
+                    ),
+                )
+                for ordinal, event_id in enumerate(segment["event_ids"]):
+                    con.execute(
+                        "INSERT INTO conversation_segment_events(segment_id,event_id,ordinal) VALUES (?,?,?)",
+                        (segment["segment_id"], event_id, ordinal),
+                    )
+
+    def analyze_conversation_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        session_gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+        context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        overlap_turns: int = DEFAULT_OVERLAP_TURNS,
+        topic_boundary_threshold: float = DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+        use_slm: bool = True,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        if not events:
+            return {
+                "conversation_id": None,
+                "boundaries": [],
+                "segments": [],
+                "chunks": [],
+                "warnings": [],
+                "model_calls": 0,
+            }
+        conversation_ids = {str(event.get("conversation_id") or "") for event in events}
+        if len(conversation_ids) != 1:
+            raise ValueError("analyze_conversation_events requires one conversation_id")
+        conversation_id = next(iter(conversation_ids))
+        ordered = sorted(
+            events,
+            key=lambda event: (
+                str(event.get("event_time") or event.get("created_at") or ""),
+                int(event.get("event_sequence") or 0),
+                str(event.get("id") or ""),
+            ),
+        )
+        selected_model = model or os.getenv("HIPPOCAMPUS_NIGHTLY_MODEL") or self.llm_model
+        session_boundaries = deterministic_session_boundaries(
+            ordered,
+            gap_minutes=session_gap_minutes,
+        )
+        session_groups = split_events(
+            ordered,
+            boundary_after_event_ids={
+                str(item["after_event_id"]) for item in session_boundaries
+            },
+        )
+        topic_boundaries: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        model_calls = 0
+        for session_events in session_groups:
+            if use_slm:
+                detected, detected_warnings, calls = self._slm_topic_boundaries(
+                    session_events,
+                    model=selected_model,
+                    context_tokens=context_tokens,
+                    overlap_turns=overlap_turns,
+                    threshold=topic_boundary_threshold,
+                )
+                topic_boundaries.extend(detected)
+                warnings.extend(detected_warnings)
+                model_calls += calls
+            else:
+                topic_boundaries.extend(
+                    {
+                        **item,
+                        "detection_source": "deterministic_rule",
+                        "model": None,
+                    }
+                    for item in explicit_topic_candidates(session_events)
+                    if float(item["confidence"]) >= topic_boundary_threshold
+                )
+        boundaries = session_boundaries + topic_boundaries
+        for boundary in boundaries:
+            boundary["model"] = boundary.get("model")
+            boundary["boundary_id"] = deterministic_id(
+                "boundary",
+                {
+                    "conversation_id": conversation_id,
+                    "boundary_type": boundary["boundary_type"],
+                    "after_event_id": boundary["after_event_id"],
+                    "segmentation_version": SEGMENTATION_VERSION,
+                },
+            )
+        boundary_by_after_type = {
+            (str(item["after_event_id"]), str(item["boundary_type"])): item
+            for item in boundaries
+        }
+        segments: list[dict[str, Any]] = []
+        chunks: list[dict[str, Any]] = []
+        for session_events in session_groups:
+            session_start = str(session_events[0]["id"])
+            session_boundary = boundary_by_after_type.get((session_start, "session"))
+            session_segment = self._segment_record(
+                conversation_id=conversation_id,
+                segment_type="session",
+                events=session_events,
+                parent_segment_id=None,
+                boundary_id=session_boundary.get("boundary_id") if session_boundary else None,
+            )
+            segments.append(session_segment)
+            topic_groups = split_events(
+                session_events,
+                boundary_after_event_ids={
+                    str(item["after_event_id"])
+                    for item in topic_boundaries
+                    if str(item["after_event_id"])
+                    in {str(event["id"]) for event in session_events}
+                },
+            )
+            for topic_events in topic_groups:
+                topic_start = str(topic_events[0]["id"])
+                topic_boundary = boundary_by_after_type.get((topic_start, "topic"))
+                topic_segment = self._segment_record(
+                    conversation_id=conversation_id,
+                    segment_type="topic",
+                    events=topic_events,
+                    parent_segment_id=session_segment["segment_id"],
+                    boundary_id=topic_boundary.get("boundary_id") if topic_boundary else None,
+                )
+                segments.append(topic_segment)
+                for chunk in token_chunks(
+                    topic_events,
+                    max_tokens=context_tokens,
+                    overlap_turns=overlap_turns,
+                ):
+                    chunks.append(
+                        {
+                            "chunk_id": deterministic_id(
+                                "chunk",
+                                {
+                                    "segment_id": topic_segment["segment_id"],
+                                    "primary_event_ids": chunk["primary_event_ids"],
+                                    "context_tokens": context_tokens,
+                                    "overlap_turns": overlap_turns,
+                                },
+                            ),
+                            "segment_id": topic_segment["segment_id"],
+                            **chunk,
+                        }
+                    )
+        analysis = {
+            "format": "hippocampus.conversation-segmentation.v1",
+            "conversation_id": conversation_id,
+            "segmentation_version": SEGMENTATION_VERSION,
+            "boundaries": boundaries,
+            "segments": segments,
+            "chunks": chunks,
+            "warnings": warnings,
+            "model": selected_model if use_slm else None,
+            "model_calls": model_calls,
+            "config": {
+                "session_gap_minutes": session_gap_minutes,
+                "context_tokens": context_tokens,
+                "overlap_turns": overlap_turns,
+                "topic_boundary_threshold": topic_boundary_threshold,
+                "use_slm": use_slm,
+            },
+        }
+        if persist:
+            self._persist_segment_analysis(analysis)
+        return analysis
+
+    def detect_conversation_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        since: str | None = None,
+        limit: int = 500,
+        model: str | None = None,
+        session_gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+        context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        overlap_turns: int = DEFAULT_OVERLAP_TURNS,
+        topic_boundary_threshold: float = DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+        use_slm: bool = True,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        filters = ["1=1"]
+        params: list[Any] = []
+        if conversation_id:
+            filters.append("conversation_id=?")
+            params.append(conversation_id)
+        if since:
+            filters.append("event_time>=?")
+            params.append(normalize_timestamp(since, self.default_timezone, field_name="since"))
+        params.append(max(1, min(int(limit), 5000)))
+        with self.connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT * FROM raw_messages
+                WHERE {' AND '.join(filters)}
+                ORDER BY conversation_id, event_time, event_sequence, created_at
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(row)
+            grouped.setdefault(str(item["conversation_id"]), []).append(item)
+        analyses = [
+            self.analyze_conversation_events(
+                events,
+                model=model,
+                session_gap_minutes=session_gap_minutes,
+                context_tokens=context_tokens,
+                overlap_turns=overlap_turns,
+                topic_boundary_threshold=topic_boundary_threshold,
+                use_slm=use_slm,
+                persist=persist,
+            )
+            for events in grouped.values()
+        ]
+        return {
+            "format": "hippocampus.conversation-segmentation-batch.v1",
+            "conversation_count": len(analyses),
+            "event_count": len(rows),
+            "boundary_count": sum(len(item["boundaries"]) for item in analyses),
+            "segment_count": sum(len(item["segments"]) for item in analyses),
+            "chunk_count": sum(len(item["chunks"]) for item in analyses),
+            "analyses": analyses,
+            "persisted": persist,
+        }
+
+    def list_conversation_boundaries(
+        self,
+        *,
+        conversation_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        filters = ["1=1"]
+        params: list[Any] = []
+        if conversation_id:
+            filters.append("conversation_id=?")
+            params.append(conversation_id)
+        params.append(max(1, min(int(limit), 1000)))
+        with self.connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT * FROM conversation_boundaries
+                WHERE {' AND '.join(filters)}
+                ORDER BY boundary_time DESC, created_at DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["signals"] = loads(item.pop("signals_json"), [])
+            result.append(item)
+        return result
+
+    def list_conversation_segments(
+        self,
+        *,
+        conversation_id: str | None = None,
+        segment_type: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if segment_type and segment_type not in {"session", "topic"}:
+            raise ValueError("segment_type must be session or topic")
+        filters = ["1=1"]
+        params: list[Any] = []
+        if conversation_id:
+            filters.append("conversation_id=?")
+            params.append(conversation_id)
+        if segment_type:
+            filters.append("segment_type=?")
+            params.append(segment_type)
+        params.append(max(1, min(int(limit), 1000)))
+        with self.connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT * FROM conversation_segments
+                WHERE {' AND '.join(filters)}
+                ORDER BY start_time DESC, created_at DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["event_ids"] = [
+                    str(value["event_id"])
+                    for value in con.execute(
+                        "SELECT event_id FROM conversation_segment_events WHERE segment_id=? ORDER BY ordinal",
+                        (item["segment_id"],),
+                    ).fetchall()
+                ]
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _nightly_candidate_schema(eligible_event_ids: list[str]) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source_event_ids": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": eligible_event_ids},
+                                "minItems": 1,
+                            },
+                            "memory_type": {
+                                "type": "string",
+                                "enum": [
+                                    "episodic",
+                                    "semantic",
+                                    "prospective",
+                                    "procedural",
+                                    "embodied",
+                                ],
+                            },
+                            "summary": {"type": "string"},
+                            "keywords": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "source_event_ids",
+                            "memory_type",
+                            "summary",
+                            "keywords",
+                            "confidence",
+                            "reason",
+                        ],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["candidates"],
+            "additionalProperties": False,
+        }
+
     def run_nightly_extraction(
         self,
         *,
@@ -1384,11 +2017,16 @@ class MemoryManager:
         limit: int = 120,
         model: str | None = None,
         dry_run: bool = False,
+        session_gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+        context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        overlap_turns: int = DEFAULT_OVERLAP_TURNS,
+        topic_boundary_threshold: float = DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+        use_boundary_slm: bool = True,
     ) -> dict[str, Any]:
         started_at = utc_now()
-        selected_model = model or self.llm_model
+        selected_model = model or os.getenv("HIPPOCAMPUS_NIGHTLY_MODEL") or self.llm_model
         filters = ["raw.role='user'", "decision.decision_id IS NULL"]
-        params: list[Any] = ["slm", "nightly_v1"]
+        params: list[Any] = ["slm", "nightly_v2"]
         if conversation_id:
             filters.append("raw.conversation_id=?")
             params.append(conversation_id)
@@ -1428,7 +2066,12 @@ class MemoryManager:
                 {
                     "source_event_ids": [row["id"] for row in source_events],
                     "model": selected_model,
-                    "extractor_version": "nightly_v1",
+                    "extractor_version": "nightly_v2",
+                    "session_gap_minutes": session_gap_minutes,
+                    "context_tokens": context_tokens,
+                    "overlap_turns": overlap_turns,
+                    "topic_boundary_threshold": topic_boundary_threshold,
+                    "use_boundary_slm": use_boundary_slm,
                 }
             ).encode("utf-8")
         ).hexdigest()
@@ -1446,6 +2089,7 @@ class MemoryManager:
             result = {
                 "job_id": job_id,
                 "status": "completed",
+                "selected": 0,
                 "examined": 0,
                 "created": 0,
                 "trace_ids": [],
@@ -1454,106 +2098,241 @@ class MemoryManager:
             self._finish_batch_job(job_id, result)
             return result
 
-        event_ids = {str(row["id"]) for row in source_events}
-        transcript = "\n".join(
-            f"[{row['id']}] {row.get('event_time') or row.get('created_at')} "
-            f"actor={row.get('actor_role') or row.get('role')} content={str(row.get('content') or '')[:1200]}"
-            for row in source_events
-        )
-        prompt = (
-            "You are the second-stage extractor for a local long-term memory service. "
-            "Review user source events that the real-time rules did not necessarily retain. "
-            "Extract only durable preferences, plans, corrections, emotionally salient experiences, "
-            "or reusable procedures. Never change who said something. Output JSON only with this shape: "
-            '{"candidates":[{"source_event_ids":["id"],"memory_type":"episodic|semantic|prospective|procedural|embodied",'
-            '"summary":"tentative summary","keywords":["term"],"confidence":0.0,"reason":"brief reason"}]}. '
-            "Use only supplied IDs. Omit ordinary small talk. Keep inferred summaries tentative.\n\n"
-            + transcript
-        )
-        try:
-            raw_response = self.chat_completion(
-                model=selected_model,
-                messages=[
-                    {"role": "system", "content": "Extract structured memory candidates. Output valid JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                max_tokens=2600,
-                timeout=int(os.getenv("HIPPOCAMPUS_SLM_TIMEOUT_SECONDS", "180")),
-            )
-            payload = self.parse_json_object(raw_response)
-            candidates = payload.get("candidates") or []
-            if not isinstance(candidates, list):
-                raise ValueError("SLM candidates must be a list.")
-            created: list[str] = []
-            accepted_sources: dict[str, list[str]] = {}
-            for item in candidates[:80]:
-                if not isinstance(item, dict):
-                    continue
-                source_ids = unique_list(
-                    [str(value) for value in item.get("source_event_ids") or [] if str(value) in event_ids]
-                )
-                memory_type = str(item.get("memory_type") or "semantic")
-                summary = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()
-                if not source_ids or memory_type not in {"episodic", "semantic", "prospective", "procedural", "embodied"}:
-                    continue
-                if len(summary) < 4:
-                    continue
-                source = next(row for row in source_events if str(row["id"]) == source_ids[0])
-                trace_id = ""
-                if not dry_run:
-                    trace = self.create_memory_trace(
-                        {
-                            "conversation_id": source.get("conversation_id"),
-                            "turn_id": source_ids[-1],
-                            "trace_stage": "candidate",
-                            "candidate_memory_type": memory_type,
-                            "title": summary[:80],
-                            "content": summary,
-                            "keywords": item.get("keywords") or query_terms(summary),
-                            "acquisition_mode": "automatic",
-                            "epistemic_status": "inferred",
-                            "epistemic_confidence": min(0.85, clamp(item.get("confidence", 0.58))),
-                            "activation": 0.58,
-                            "salience": 0.62,
-                            "stability": 0.12,
-                            "capture_score": 0.62,
-                            "extraction_reasons": ["nightly_slm_reassessment", str(item.get("reason") or "durable_signal")],
-                            "content_fingerprint": content_fingerprint(summary),
-                            "observed_at": source.get("event_time") or source.get("created_at"),
-                            "event_time": source.get("event_time") or source.get("created_at"),
-                            "received_at": source.get("received_at") or source.get("created_at"),
-                            "persisted_at": utc_now(),
-                            "source_time": source.get("source_time") or source.get("event_time"),
-                            "timezone": source.get("timezone") or self.default_timezone,
-                            "time_source": source.get("time_source") or "source_event",
-                            "evidence_summary": "Nightly SLM candidate extraction; deterministic provenance validation applied.",
-                            "source_event_ids": source_ids,
-                            "source": {
-                                "conversation_id": source.get("conversation_id"),
-                                "extractor": "slm_nightly_v1",
-                                "model": selected_model,
-                            },
-                            "actor_role": "system",
-                            "source_channel": "nightly_extraction",
-                            "content_origin": "summary",
-                            "extractor": "slm_nightly_v1",
-                            "derived_from": [
-                                {"object_type": "raw_message", "object_id": value, "relation": "summarized_from"}
-                                for value in source_ids
-                            ],
-                        }
-                    )
-                    trace_id = str(trace["id"])
-                    created.append(trace_id)
-                for source_id in source_ids:
-                    accepted_sources.setdefault(source_id, []).append(trace_id or "dry_run")
+        eligible_event_ids = {str(row["id"]) for row in source_events}
+        source_by_id = {str(row["id"]): row for row in source_events}
+        selected_by_conversation: dict[str, list[dict[str, Any]]] = {}
+        for row in source_events:
+            selected_by_conversation.setdefault(str(row["conversation_id"]), []).append(row)
 
+        analyses: list[dict[str, Any]] = []
+        context_limit = min(5000, max(200, int(limit) * 4))
+        with self.connect() as con:
+            for selected in selected_by_conversation.values():
+                conversation_key = str(selected[0]["conversation_id"])
+                latest = max(
+                    str(row.get("event_time") or row.get("created_at") or "")
+                    for row in selected
+                )
+                latest_dt = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+                context_end = (latest_dt + timedelta(minutes=session_gap_minutes)).isoformat(
+                    timespec="milliseconds"
+                )
+                context_rows = con.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT * FROM raw_messages
+                        WHERE conversation_id=? AND event_time<=?
+                        ORDER BY event_time DESC, event_sequence DESC, created_at DESC
+                        LIMIT ?
+                    )
+                    ORDER BY event_time, event_sequence, created_at
+                    """,
+                    (conversation_key, context_end, context_limit),
+                ).fetchall()
+                analyses.append(
+                    self.analyze_conversation_events(
+                        [dict(row) for row in context_rows],
+                        model=selected_model,
+                        session_gap_minutes=session_gap_minutes,
+                        context_tokens=context_tokens,
+                        overlap_turns=overlap_turns,
+                        topic_boundary_threshold=topic_boundary_threshold,
+                        use_slm=use_boundary_slm,
+                        persist=not dry_run,
+                    )
+                )
+
+        created: list[str] = []
+        accepted_sources: dict[str, list[str]] = {}
+        processed_source_ids: set[str] = set()
+        seen_candidates: set[tuple[str, str, tuple[str, ...]]] = set()
+        candidate_count = 0
+        extraction_calls = 0
+        chunk_errors: list[dict[str, str]] = []
+        processed_chunks = 0
+        estimated_input_tokens = 0
+        try:
+            for analysis in analyses:
+                for chunk in analysis["chunks"]:
+                    chunk_eligible = [
+                        event_id
+                        for event_id in chunk["primary_event_ids"]
+                        if event_id in eligible_event_ids
+                    ]
+                    if not chunk_eligible:
+                        continue
+                    transcript = "\n".join(
+                        f"[{event['id']}] {event.get('event_time') or event.get('created_at')} "
+                        f"actor={event.get('actor_role') or event.get('role')} "
+                        f"content={re.sub(r'\s+', ' ', str(event.get('content') or '')).strip()}"
+                        for event in chunk["events"]
+                    )
+                    prompt = (
+                        "Review this bounded conversation segment for durable memory candidates. "
+                        "Assistant and system events are context only. Every candidate must be grounded "
+                        "in one or more eligible user source event IDs. Extract durable preferences, "
+                        "plans, corrections, emotionally salient experiences, or reusable procedures. "
+                        "Omit ordinary small talk, preserve actor attribution, and keep inferred summaries "
+                        "tentative.\n\n"
+                        f"Eligible user source event IDs: {dumps(chunk_eligible)}\n"
+                        f"Topic segment ID: {chunk['segment_id']}\n"
+                        f"Chunk ID: {chunk['chunk_id']}\n\n{transcript}"
+                    )
+                    try:
+                        extraction_calls += 1
+                        raw_response = self.chat_completion(
+                            model=selected_model,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Extract structured long-term memory candidates. "
+                                        "Return JSON matching the supplied schema."
+                                    ),
+                                },
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=0.0,
+                            max_tokens=2600,
+                            timeout=int(os.getenv("HIPPOCAMPUS_SLM_TIMEOUT_SECONDS", "180")),
+                            response_format={
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "hippocampus_nightly_candidates",
+                                    "strict": True,
+                                    "schema": self._nightly_candidate_schema(chunk_eligible),
+                                },
+                            },
+                        )
+                        payload = self.parse_json_object(raw_response)
+                        candidates = payload.get("candidates") or []
+                        if not isinstance(candidates, list):
+                            raise ValueError("SLM candidates must be a list.")
+                        processed_source_ids.update(chunk_eligible)
+                        processed_chunks += 1
+                        estimated_input_tokens += int(chunk["estimated_tokens"])
+                        candidate_count += len(candidates)
+                        for item in candidates[:80]:
+                            if not isinstance(item, dict):
+                                continue
+                            source_ids = unique_list(
+                                [
+                                    str(value)
+                                    for value in item.get("source_event_ids") or []
+                                    if str(value) in chunk_eligible
+                                ]
+                            )
+                            memory_type = str(item.get("memory_type") or "semantic")
+                            summary = re.sub(
+                                r"\s+", " ", str(item.get("summary") or "")
+                            ).strip()
+                            if (
+                                not source_ids
+                                or memory_type
+                                not in {
+                                    "episodic",
+                                    "semantic",
+                                    "prospective",
+                                    "procedural",
+                                    "embodied",
+                                }
+                                or len(summary) < 4
+                            ):
+                                continue
+                            dedupe_key = (
+                                memory_type,
+                                content_fingerprint(summary),
+                                tuple(sorted(source_ids)),
+                            )
+                            if dedupe_key in seen_candidates:
+                                continue
+                            seen_candidates.add(dedupe_key)
+                            source = source_by_id[source_ids[0]]
+                            trace_id = ""
+                            if not dry_run:
+                                trace = self.create_memory_trace(
+                                    {
+                                        "conversation_id": source.get("conversation_id"),
+                                        "turn_id": source_ids[-1],
+                                        "trace_stage": "candidate",
+                                        "candidate_memory_type": memory_type,
+                                        "title": summary[:80],
+                                        "content": summary,
+                                        "keywords": item.get("keywords") or query_terms(summary),
+                                        "acquisition_mode": "automatic",
+                                        "epistemic_status": "inferred",
+                                        "epistemic_confidence": min(
+                                            0.85, clamp(item.get("confidence", 0.58))
+                                        ),
+                                        "activation": 0.58,
+                                        "salience": 0.62,
+                                        "stability": 0.12,
+                                        "capture_score": 0.62,
+                                        "extraction_reasons": [
+                                            "nightly_segmented_reassessment",
+                                            str(item.get("reason") or "durable_signal"),
+                                        ],
+                                        "content_fingerprint": content_fingerprint(summary),
+                                        "observed_at": source.get("event_time")
+                                        or source.get("created_at"),
+                                        "event_time": source.get("event_time")
+                                        or source.get("created_at"),
+                                        "received_at": source.get("received_at")
+                                        or source.get("created_at"),
+                                        "persisted_at": utc_now(),
+                                        "source_time": source.get("source_time")
+                                        or source.get("event_time"),
+                                        "timezone": source.get("timezone")
+                                        or self.default_timezone,
+                                        "time_source": source.get("time_source")
+                                        or "source_event",
+                                        "evidence_summary": (
+                                            "Segmented nightly LLM candidate extraction; "
+                                            "deterministic provenance validation applied."
+                                        ),
+                                        "source_event_ids": source_ids,
+                                        "source": {
+                                            "conversation_id": source.get("conversation_id"),
+                                            "extractor": "slm_nightly_v2",
+                                            "model": selected_model,
+                                            "segment_id": chunk["segment_id"],
+                                            "chunk_id": chunk["chunk_id"],
+                                        },
+                                        "actor_role": "system",
+                                        "source_channel": "nightly_extraction",
+                                        "content_origin": "summary",
+                                        "extractor": "slm_nightly_v2",
+                                        "derived_from": [
+                                            {
+                                                "object_type": "raw_message",
+                                                "object_id": value,
+                                                "relation": "summarized_from",
+                                            }
+                                            for value in source_ids
+                                        ],
+                                    }
+                                )
+                                trace_id = str(trace["id"])
+                                created.append(trace_id)
+                            for source_id in source_ids:
+                                accepted_sources.setdefault(source_id, []).append(
+                                    trace_id or "dry_run"
+                                )
+                    except Exception as exc:
+                        chunk_errors.append(
+                            {
+                                "chunk_id": str(chunk["chunk_id"]),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+
+            if not processed_source_ids and chunk_errors:
+                raise RuntimeError("All segmented extraction chunks failed.")
             if not dry_run:
                 now = utc_now()
                 with self.connect() as con:
-                    for row in source_events:
-                        source_id = str(row["id"])
+                    for source_id in sorted(processed_source_ids):
+                        row = source_by_id[source_id]
                         trace_ids = accepted_sources.get(source_id, [])
                         con.execute(
                             """
@@ -1563,20 +2342,52 @@ class MemoryManager:
                             VALUES (?,?,?,?,?,?,?,?,?,?)
                             """,
                             (
-                                new_id("decision"), source_id, row["conversation_id"], "slm", "nightly_v1",
-                                "created" if trace_ids else "skipped", 0.62 if trace_ids else 0.0,
-                                "nightly_slm_reassessment", dumps(trace_ids), now,
+                                new_id("decision"), source_id, row["conversation_id"],
+                                "slm", "nightly_v2", "created" if trace_ids else "skipped",
+                                0.62 if trace_ids else 0.0, "nightly_segmented_reassessment",
+                                dumps(trace_ids), now,
                             ),
                         )
+            segments = [segment for analysis in analyses for segment in analysis["segments"]]
+            boundaries = [
+                boundary for analysis in analyses for boundary in analysis["boundaries"]
+            ]
+            status = "completed_with_warnings" if chunk_errors else "completed"
             result = {
                 "job_id": job_id,
-                "status": "completed",
-                "examined": len(source_events),
-                "candidate_count": len(candidates),
+                "status": status,
+                "selected": len(source_events),
+                "examined": len(processed_source_ids),
+                "candidate_count": candidate_count,
                 "created": len(created),
                 "trace_ids": created,
                 "dry_run": dry_run,
                 "model": selected_model,
+                "session_count": sum(
+                    1 for segment in segments if segment["segment_type"] == "session"
+                ),
+                "topic_segment_count": sum(
+                    1 for segment in segments if segment["segment_type"] == "topic"
+                ),
+                "boundary_count": len(boundaries),
+                "chunk_count": processed_chunks,
+                "boundary_model_calls": sum(
+                    int(analysis["model_calls"]) for analysis in analyses
+                ),
+                "extraction_model_calls": extraction_calls,
+                "estimated_input_tokens": estimated_input_tokens,
+                "warnings": unique_list(
+                    [warning for analysis in analyses for warning in analysis["warnings"]],
+                    [item["error"] for item in chunk_errors],
+                ),
+                "chunk_errors": chunk_errors,
+                "config": {
+                    "session_gap_minutes": session_gap_minutes,
+                    "context_tokens": context_tokens,
+                    "overlap_turns": overlap_turns,
+                    "topic_boundary_threshold": topic_boundary_threshold,
+                    "use_boundary_slm": use_boundary_slm,
+                },
             }
             self._finish_batch_job(job_id, result)
             return result
@@ -1592,8 +2403,8 @@ class MemoryManager:
     def _finish_batch_job(self, job_id: str, result: dict[str, Any]) -> None:
         with self.connect() as con:
             con.execute(
-                "UPDATE batch_jobs SET status='completed', result_json=?, completed_at=? WHERE job_id=?",
-                (dumps(result), utc_now(), job_id),
+                "UPDATE batch_jobs SET status=?, result_json=?, completed_at=? WHERE job_id=?",
+                (str(result.get("status") or "completed"), dumps(result), utc_now(), job_id),
             )
 
     def run_nightly_cycle(
@@ -1605,6 +2416,11 @@ class MemoryManager:
         model: str | None = None,
         auto_consolidate: bool = False,
         dry_run: bool = False,
+        session_gap_minutes: int = DEFAULT_SESSION_GAP_MINUTES,
+        context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        overlap_turns: int = DEFAULT_OVERLAP_TURNS,
+        topic_boundary_threshold: float = DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+        use_boundary_slm: bool = True,
     ) -> dict[str, Any]:
         since = (datetime.now(timezone.utc) - timedelta(hours=max(1, since_hours))).isoformat(
             timespec="milliseconds"
@@ -1615,6 +2431,11 @@ class MemoryManager:
             limit=limit,
             model=model,
             dry_run=dry_run,
+            session_gap_minutes=session_gap_minutes,
+            context_tokens=context_tokens,
+            overlap_turns=overlap_turns,
+            topic_boundary_threshold=topic_boundary_threshold,
+            use_boundary_slm=use_boundary_slm,
         )
         if dry_run:
             return {"status": "completed", "dry_run": True, "extraction": extraction}
@@ -3510,6 +4331,9 @@ class MemoryManager:
     def hardening_status(self) -> dict[str, Any]:
         return self.layered.hardening_status()
 
+    def segmentation_status(self) -> dict[str, Any]:
+        return self.layered.segmentation_status()
+
     def create_signed_checkpoint(self, reason: str = "manual") -> dict[str, Any]:
         return self.layered.create_signed_checkpoint(reason=reason)
 
@@ -3714,6 +4538,8 @@ class MemoryManager:
                     "SELECT * FROM batch_jobs ORDER BY started_at DESC LIMIT 20"
                 ).fetchall()
             ]
+            for job in jobs:
+                job["result"] = loads(job.pop("result_json"), {})
             decisions = {
                 f"{row['extractor']}:{row['decision']}": int(row["count"])
                 for row in con.execute(
@@ -3754,6 +4580,7 @@ class MemoryManager:
                     mismatches += 1
         return {
             "complete": self.hardening_status()["complete"],
+            "segmentation": self.segmentation_status(),
             "recent_jobs": jobs,
             "extraction_decisions": decisions,
             "gate_metrics": gates,

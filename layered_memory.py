@@ -114,6 +114,12 @@ HARDENING_TABLES = {
     "claim_extraction_cache",
     "gate_evaluations",
 }
+SEGMENTATION_SCHEMA_VERSION = 8
+SEGMENTATION_TABLES = {
+    "conversation_boundaries",
+    "conversation_segments",
+    "conversation_segment_events",
+}
 
 
 def utc_now() -> str:
@@ -334,6 +340,7 @@ class LayeredMemoryStore:
             )
             self.migrate_phase5_schema(con)
             self.migrate_hardening_schema(con)
+            self.migrate_segmentation_schema(con)
             if own:
                 con.commit()
             return migrated
@@ -1030,6 +1037,102 @@ class LayeredMemoryStore:
                 "restartable_batch_jobs": "batch_jobs" in tables,
                 "claim_extraction_cache": "claim_extraction_cache" in tables,
                 "gate_metrics": "gate_evaluations" in tables,
+            },
+        }
+
+    def migrate_segmentation_schema(self, con: sqlite3.Connection) -> None:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_boundaries (
+                boundary_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                boundary_type TEXT NOT NULL CHECK(boundary_type IN ('session','topic')),
+                before_event_id TEXT,
+                after_event_id TEXT NOT NULL,
+                boundary_time TEXT,
+                detection_source TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                signals_json TEXT NOT NULL DEFAULT '[]',
+                previous_topic TEXT,
+                next_topic TEXT,
+                model TEXT,
+                segmentation_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(conversation_id, after_event_id, boundary_type, segmentation_version)
+            );
+            CREATE TABLE IF NOT EXISTS conversation_segments (
+                segment_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                segment_type TEXT NOT NULL CHECK(segment_type IN ('session','topic')),
+                parent_segment_id TEXT,
+                start_event_id TEXT NOT NULL,
+                end_event_id TEXT NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
+                boundary_id TEXT,
+                event_count INTEGER NOT NULL,
+                estimated_tokens INTEGER NOT NULL,
+                segmentation_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(
+                    conversation_id, segment_type, start_event_id, end_event_id,
+                    segmentation_version
+                )
+            );
+            CREATE TABLE IF NOT EXISTS conversation_segment_events (
+                segment_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY(segment_id, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_boundaries_lookup
+                ON conversation_boundaries(conversation_id, boundary_time, boundary_type);
+            CREATE INDEX IF NOT EXISTS idx_conversation_segments_lookup
+                ON conversation_segments(conversation_id, segment_type, start_time);
+            CREATE INDEX IF NOT EXISTS idx_conversation_segment_events_event
+                ON conversation_segment_events(event_id, segment_id);
+            """
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, description, applied_at) VALUES (?,?,?)",
+            (
+                SEGMENTATION_SCHEMA_VERSION,
+                "temporal sessions, inferred topic boundaries, and token-budget segments",
+                utc_now(),
+            ),
+        )
+
+    def segmentation_status(self) -> dict[str, Any]:
+        with self.connect() as con:
+            tables = {
+                str(row["name"])
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            migration = con.execute(
+                "SELECT version, description, applied_at FROM schema_migrations WHERE version=?",
+                (SEGMENTATION_SCHEMA_VERSION,),
+            ).fetchone()
+            counts = {
+                table: int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in SEGMENTATION_TABLES
+                if table in tables
+            }
+        missing = sorted(SEGMENTATION_TABLES - tables)
+        return {
+            "phase": "conversation_segmentation",
+            "complete": migration is not None and not missing,
+            "schema_version": SEGMENTATION_SCHEMA_VERSION,
+            "migration": dict(migration) if migration is not None else None,
+            "missing_tables": missing,
+            "counts": counts,
+            "capabilities": {
+                "temporal_session_boundaries": "conversation_boundaries" in tables,
+                "inferred_topic_boundaries": "conversation_boundaries" in tables,
+                "hierarchical_segments": "conversation_segments" in tables,
+                "event_segment_membership": "conversation_segment_events" in tables,
             },
         }
 

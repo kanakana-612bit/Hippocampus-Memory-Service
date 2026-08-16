@@ -221,19 +221,40 @@ Reusing a key with a different payload is rejected.
 
 ## Nightly Reassessment
 
-The real-time extractor is followed by an optional SLM reassessment of raw user
-events. The SLM may only structure candidates; supplied source IDs are checked
-deterministically and every accepted result starts as an inferred short-term
+The real-time extractor is followed by an optional nightly reassessment. A
+configurable user-activity gap first creates deterministic session boundaries.
+Within each session, explicit transition expressions are treated as candidates
+and an available LLM classifies genuine semantic topic changes. Topic segments
+are then divided by an estimated token budget with overlapping context.
+
+Assistant and system events are supplied as context, but a memory candidate may
+only cite eligible user source event IDs. Boundary and candidate IDs are checked
+deterministically, and every accepted result starts as an inferred short-term
 trace.
 
 ```powershell
-python scripts/run_nightly_maintenance.py --since-hours 36 --auto-consolidate
+python scripts/run_nightly_maintenance.py `
+  --since-hours 36 `
+  --model your-long-context-model `
+  --session-gap-minutes 90 `
+  --context-tokens 12000 `
+  --overlap-turns 2 `
+  --auto-consolidate
 ```
+
+Set `HIPPOCAMPUS_NIGHTLY_MODEL` to keep the nightly model independent from the
+resident real-time claim extractor. Use `POST /memory/segments/detect` for a
+segmentation-only run. `GET /memory/boundaries`, `GET /memory/segments`, and
+`GET /status/segmentation` expose persisted derived boundaries and segments.
+Transition expressions are never treated as proof of a topic change when the
+LLM classifier is available; they are only high-precision candidate signals.
 
 Use `POST /memory/nightly/extract` for extraction only or
 `POST /memory/nightly/run` for extraction, decay/consolidation, and a signed
 checkpoint. `GET /status/nightly` reports recent jobs, decisions, gate latency,
-and trace/source edge mismatches.
+trace/source edge mismatches, estimated input tokens, segment counts, and model
+call counts. These metrics allow context budgets to be tuned without publishing
+raw conversations.
 
 ## Initial Learning From OpenWebUI
 
@@ -483,6 +504,7 @@ forgetting, and privacy without describing deployment-specific integrations.
 - `POST /temporal/validate`
 - `GET /status/hardening`
 - `GET /status/nightly`
+- `GET /status/segmentation`
 - `POST /memory/traces`
 - `GET /memory/traces`
 - `GET/PATCH/DELETE /memory/traces/{trace_id}`
@@ -492,6 +514,9 @@ forgetting, and privacy without describing deployment-specific integrations.
 - `POST /memory/maintenance`
 - `POST /memory/nightly/extract`
 - `POST /memory/nightly/run`
+- `POST /memory/segments/detect`
+- `GET /memory/boundaries`
+- `GET /memory/segments`
 - `POST /memories/retrieve`
 - `GET /memories`
 - `GET /memories/{memory_id}/evidence`
@@ -518,8 +543,8 @@ code belongs on `Private`; runtime data belongs in neither branch.
 ## Status
 
 Memory-domain phases 1 through 5, the two-stage extraction pipeline, request
-idempotency, response attribution gate, explicit-date temporal gate, and
-nightly runner are implemented. Existing
+idempotency, response attribution gate, explicit-date temporal gate, hybrid
+conversation segmentation, and the segmented nightly runner are implemented. Existing
 episodic/project/persistent rows are projected into the canonical long-term
 table at startup while legacy routes remain available. Back up a real SQLite
 database before first migration.

@@ -139,7 +139,7 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(result["created"], 1)
         trace = self.manager.get_memory_trace(result["trace_ids"][0])
         self.assertEqual(trace["source_event_ids"], ["nightly-source"])
-        self.assertEqual(trace["extractor"], "slm_nightly_v1")
+        self.assertEqual(trace["extractor"], "slm_nightly_v2")
         self.assertEqual(trace["epistemic_status"], "inferred")
 
     def test_slm_claim_extraction_does_not_decide_actor_validity(self) -> None:

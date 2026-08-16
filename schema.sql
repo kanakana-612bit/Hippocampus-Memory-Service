@@ -514,6 +514,52 @@ CREATE TABLE IF NOT EXISTS gate_evaluations (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversation_boundaries (
+    boundary_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    boundary_type TEXT NOT NULL CHECK(boundary_type IN ('session','topic')),
+    before_event_id TEXT,
+    after_event_id TEXT NOT NULL,
+    boundary_time TEXT,
+    detection_source TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    signals_json TEXT NOT NULL DEFAULT '[]',
+    previous_topic TEXT,
+    next_topic TEXT,
+    model TEXT,
+    segmentation_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(conversation_id, after_event_id, boundary_type, segmentation_version)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_segments (
+    segment_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    segment_type TEXT NOT NULL CHECK(segment_type IN ('session','topic')),
+    parent_segment_id TEXT,
+    start_event_id TEXT NOT NULL,
+    end_event_id TEXT NOT NULL,
+    start_time TEXT,
+    end_time TEXT,
+    boundary_id TEXT,
+    event_count INTEGER NOT NULL,
+    estimated_tokens INTEGER NOT NULL,
+    segmentation_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(
+        conversation_id, segment_type, start_event_id, end_event_id,
+        segmentation_version
+    )
+);
+
+CREATE TABLE IF NOT EXISTS conversation_segment_events (
+    segment_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY(segment_id, event_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     memory_id UNINDEXED,
     memory_type UNINDEXED,
@@ -612,3 +658,12 @@ CREATE INDEX IF NOT EXISTS idx_claim_cache_digest
 
 CREATE INDEX IF NOT EXISTS idx_gate_evaluations_type
     ON gate_evaluations(gate_type, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_boundaries_lookup
+    ON conversation_boundaries(conversation_id, boundary_time, boundary_type);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_segments_lookup
+    ON conversation_segments(conversation_id, segment_type, start_time);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_segment_events_event
+    ON conversation_segment_events(event_id, segment_id);

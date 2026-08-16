@@ -93,6 +93,65 @@ class LayeredMemoryApiTests(unittest.TestCase):
         self.assertEqual(body["missing_objects"], [])
         self.assertTrue(all(body["capabilities"].values()))
 
+    def test_conversation_segmentation_routes(self) -> None:
+        conversation_id = "api-segmentation-chat"
+        self.manager.ingest_messages(
+            conversation_id,
+            [
+                {
+                    "id": "api-segment-u1",
+                    "role": "user",
+                    "content": "First topic",
+                    "event_time": "2026-08-16T09:00:00+00:00",
+                },
+                {
+                    "id": "api-segment-a1",
+                    "role": "assistant",
+                    "content": "First response",
+                    "event_time": "2026-08-16T09:01:00+00:00",
+                },
+                {
+                    "id": "api-segment-u2",
+                    "role": "user",
+                    "content": "Later topic",
+                    "event_time": "2026-08-16T11:00:00+00:00",
+                },
+            ],
+            auto_capture=False,
+        )
+
+        detected = self.client.post(
+            "/memory/segments/detect",
+            json={
+                "conversation_id": conversation_id,
+                "session_gap_minutes": 90,
+                "use_slm": False,
+                "persist": True,
+            },
+        )
+        self.assertEqual(detected.status_code, 200, detected.text)
+        body = detected.json()
+        self.assertEqual(body["boundary_count"], 1)
+        self.assertEqual(body["segment_count"], 4)
+
+        boundaries = self.client.get(
+            "/memory/boundaries", params={"conversation_id": conversation_id}
+        )
+        self.assertEqual(boundaries.status_code, 200, boundaries.text)
+        self.assertEqual(boundaries.json()[0]["after_event_id"], "api-segment-u2")
+
+        segments = self.client.get(
+            "/memory/segments",
+            params={"conversation_id": conversation_id, "segment_type": "session"},
+        )
+        self.assertEqual(segments.status_code, 200, segments.text)
+        self.assertEqual(len(segments.json()), 2)
+
+        status = self.client.get("/status/segmentation")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["complete"])
+        self.assertEqual(status.json()["schema_version"], 8)
+
     def test_structured_slm_claim_route_accepts_user_or_assistant_input(self) -> None:
         extracted = {
             "format": "hippocampus.structured-claims.v1",

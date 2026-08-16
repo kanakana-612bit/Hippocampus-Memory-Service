@@ -9,6 +9,12 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from conversation_segmentation import (
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_OVERLAP_TURNS,
+    DEFAULT_SESSION_GAP_MINUTES,
+    DEFAULT_TOPIC_BOUNDARY_THRESHOLD,
+)
 from memory_manager import MemoryManager, new_id, query_terms
 
 
@@ -35,7 +41,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Hippocampus Memory Service",
-    version="0.9.0",
+    version="0.10.0",
     description="Layered short-term and long-term memory service for local chat frontends.",
     default_response_class=UTF8JSONResponse,
     lifespan=lifespan,
@@ -305,6 +311,13 @@ class NightlyExtractionRequest(BaseModel):
     limit: int = Field(default=120, ge=1, le=500)
     model: str | None = None
     dry_run: bool = False
+    session_gap_minutes: int = Field(default=DEFAULT_SESSION_GAP_MINUTES, ge=5, le=24 * 60)
+    context_tokens: int = Field(default=DEFAULT_CONTEXT_TOKENS, ge=512, le=262144)
+    overlap_turns: int = Field(default=DEFAULT_OVERLAP_TURNS, ge=0, le=20)
+    topic_boundary_threshold: float = Field(
+        default=DEFAULT_TOPIC_BOUNDARY_THRESHOLD, ge=0.0, le=1.0
+    )
+    use_boundary_slm: bool = True
 
 
 class NightlyCycleRequest(BaseModel):
@@ -314,6 +327,28 @@ class NightlyCycleRequest(BaseModel):
     model: str | None = None
     auto_consolidate: bool = False
     dry_run: bool = False
+    session_gap_minutes: int = Field(default=DEFAULT_SESSION_GAP_MINUTES, ge=5, le=24 * 60)
+    context_tokens: int = Field(default=DEFAULT_CONTEXT_TOKENS, ge=512, le=262144)
+    overlap_turns: int = Field(default=DEFAULT_OVERLAP_TURNS, ge=0, le=20)
+    topic_boundary_threshold: float = Field(
+        default=DEFAULT_TOPIC_BOUNDARY_THRESHOLD, ge=0.0, le=1.0
+    )
+    use_boundary_slm: bool = True
+
+
+class ConversationSegmentationRequest(BaseModel):
+    conversation_id: str | None = None
+    since: str | None = None
+    limit: int = Field(default=500, ge=1, le=5000)
+    model: str | None = None
+    session_gap_minutes: int = Field(default=DEFAULT_SESSION_GAP_MINUTES, ge=5, le=24 * 60)
+    context_tokens: int = Field(default=DEFAULT_CONTEXT_TOKENS, ge=512, le=262144)
+    overlap_turns: int = Field(default=DEFAULT_OVERLAP_TURNS, ge=0, le=20)
+    topic_boundary_threshold: float = Field(
+        default=DEFAULT_TOPIC_BOUNDARY_THRESHOLD, ge=0.0, le=1.0
+    )
+    use_slm: bool = True
+    persist: bool = True
 
 
 class LongTermMemoryPatch(BaseModel):
@@ -469,6 +504,11 @@ def hardening_status() -> dict[str, Any]:
 @app.get("/status/nightly")
 def nightly_status() -> dict[str, Any]:
     return manager.nightly_status()
+
+
+@app.get("/status/segmentation")
+def segmentation_status() -> dict[str, Any]:
+    return manager.segmentation_status()
 
 
 @app.get("/status/attribution-gate")
@@ -914,6 +954,11 @@ def run_nightly_extraction(req: NightlyExtractionRequest) -> dict[str, Any]:
             limit=req.limit,
             model=req.model,
             dry_run=req.dry_run,
+            session_gap_minutes=req.session_gap_minutes,
+            context_tokens=req.context_tokens,
+            overlap_turns=req.overlap_turns,
+            topic_boundary_threshold=req.topic_boundary_threshold,
+            use_boundary_slm=req.use_boundary_slm,
         )
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -929,9 +974,57 @@ def run_nightly_cycle(req: NightlyCycleRequest) -> dict[str, Any]:
             model=req.model,
             auto_consolidate=req.auto_consolidate,
             dry_run=req.dry_run,
+            session_gap_minutes=req.session_gap_minutes,
+            context_tokens=req.context_tokens,
+            overlap_turns=req.overlap_turns,
+            topic_boundary_threshold=req.topic_boundary_threshold,
+            use_boundary_slm=req.use_boundary_slm,
         )
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/memory/segments/detect")
+def detect_conversation_segments(req: ConversationSegmentationRequest) -> dict[str, Any]:
+    try:
+        return manager.detect_conversation_segments(
+            conversation_id=req.conversation_id,
+            since=req.since,
+            limit=req.limit,
+            model=req.model,
+            session_gap_minutes=req.session_gap_minutes,
+            context_tokens=req.context_tokens,
+            overlap_turns=req.overlap_turns,
+            topic_boundary_threshold=req.topic_boundary_threshold,
+            use_slm=req.use_slm,
+            persist=req.persist,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/memory/boundaries")
+def list_conversation_boundaries(
+    conversation_id: str | None = None,
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[dict[str, Any]]:
+    return manager.list_conversation_boundaries(
+        conversation_id=conversation_id,
+        limit=limit,
+    )
+
+
+@app.get("/memory/segments")
+def list_conversation_segments(
+    conversation_id: str | None = None,
+    segment_type: Literal["session", "topic"] | None = None,
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[dict[str, Any]]:
+    return manager.list_conversation_segments(
+        conversation_id=conversation_id,
+        segment_type=segment_type,
+        limit=limit,
+    )
 
 
 @app.post("/memories/retrieve")
