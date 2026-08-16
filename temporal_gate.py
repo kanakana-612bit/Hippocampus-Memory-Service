@@ -14,8 +14,9 @@ DATE_PATTERN = re.compile(
     r"(?P<month>\d{1,2})\s*(?:月|[-/])\s*(?P<day>\d{1,2})\s*日?"
 )
 PAST_WORDS = re.compile(
-    r"した|しました|だった|でした|済み|終わった|行った|買った|食べた|"
-    r"yesterday|ago|did|was|were|completed|went|bought|ate",
+    r"(?:した|しました|だった|でした|終わった|行った|買った|食べた)"
+    r"(?!ら|なら|場合|とき|時|際|として)|済み(?!次第|なら|の場合)|"
+    r"\b(?:yesterday|ago|did|was|were|completed|went|bought|ate)\b",
     re.I,
 )
 FUTURE_WORDS = re.compile(

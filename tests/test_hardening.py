@@ -315,6 +315,14 @@ class HardeningTests(unittest.TestCase):
             as_of="2026-08-15T12:00:00+09:00",
             timezone="Asia/Tokyo",
         )
+        polite_conditional = self.manager.validate_response_temporal(
+            content=(
+                "承知いたしました。明日（8月13日）の午前9時になりましたら、"
+                "買い物の時間だとお知らせします。"
+            ),
+            as_of="2026-08-16T11:31:00+09:00",
+            timezone="Asia/Tokyo",
+        )
 
         self.assertEqual(wrong_today["decision"], "reject")
         self.assertEqual(past_reminder["decision"], "reject")
@@ -325,6 +333,11 @@ class HardeningTests(unittest.TestCase):
             "future_action_negated",
         )
         self.assertEqual(affirmative_with_negative_purpose["decision"], "reject")
+        self.assertEqual(polite_conditional["decision"], "reject")
+        self.assertEqual(
+            polite_conditional["claims"][0]["reason"],
+            "future_action_date_is_past",
+        )
 
     def test_supersession_marks_prospective_dependents_for_review(self) -> None:
         old_trace = self.manager.create_memory_trace(
