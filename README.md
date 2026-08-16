@@ -454,8 +454,10 @@ The gate returns one of three decisions:
 
 Prompt context carries compact `[[event:ID]]` and `[[memory:ID]]` references so
 a model can identify the evidence it used. The public API can validate one
-candidate or select among several. If no candidate passes, it requests one
-attribution-safe regeneration instead of displaying a known-bad attribution.
+candidate or select among several. The host integration may request up to three
+attribution-safe regenerations within a 30-second deadline. If no candidate
+passes, it records an explicit `validation_failed` status and displays a neutral
+failure message instead of a known-bad attribution.
 
 This does not prove that the response is factually correct. It only checks
 whether the response is entitled to assign a remembered proposition to the

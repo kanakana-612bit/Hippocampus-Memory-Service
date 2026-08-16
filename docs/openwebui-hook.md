@@ -52,6 +52,8 @@ HIPPOCAMPUS_CONTEXT_CHAR_BUDGET=2500
 HIPPOCAMPUS_ATTRIBUTION_GATE_ENABLED=1
 HIPPOCAMPUS_ATTRIBUTION_GATE_MODE=risk_based
 HIPPOCAMPUS_ATTRIBUTION_TIMEOUT_SECONDS=5.0
+HIPPOCAMPUS_VALIDATION_MAX_RETRIES=3
+HIPPOCAMPUS_VALIDATION_DEADLINE_SECONDS=30.0
 HIPPOCAMPUS_ATTRIBUTION_GATE_FAIL_CLOSED=1
 HIPPOCAMPUS_TEMPORAL_GATE_ENABLED=1
 ```
@@ -123,11 +125,24 @@ For a gated response, the OpenWebUI integration buffers the draft and calls
 - a past date cannot be presented as a pending future reminder, while a
   correctly worded historical event remains allowed.
 
-If the first candidate is contradicted or unverified, OpenWebUI requests one
-regeneration with narrow correction feedback and validates it again. If the
-retry still fails, it displays a neutral fallback rather than the rejected
-draft. `HIPPOCAMPUS_ATTRIBUTION_GATE_FAIL_CLOSED=1` applies the same behavior
-when the validator itself is unavailable during a gated response.
+If the first candidate is contradicted or unverified, OpenWebUI requests a new
+candidate with narrow correction feedback and validates it again. The recovery
+loop stops at whichever limit comes first:
+
+- `HIPPOCAMPUS_VALIDATION_MAX_RETRIES` regenerated candidates; or
+- `HIPPOCAMPUS_VALIDATION_DEADLINE_SECONDS` total wall-clock seconds.
+
+The recommended defaults are three retries and 30 seconds. Transport failures
+retry the deterministic validation before asking the model for another draft;
+changing the text cannot repair an unavailable validator. A regenerated draft
+is never displayed until it passes both enabled gates.
+
+If no candidate passes, the integration stores `status=failed` and
+`decision=validation_failed` with the retry count, elapsed time, reason, and a
+content-free attempt summary. It displays an explicit validation-failure
+message instead of the rejected draft. Failure messages are not ingested as
+assistant memories. `HIPPOCAMPUS_ATTRIBUTION_GATE_FAIL_CLOSED=1` applies the
+same behavior when the validator itself is unavailable during a gated response.
 
 The gates are not general factuality checkers and do not review the whole
 answer. They only check actor attribution and explicit temporal consistency.

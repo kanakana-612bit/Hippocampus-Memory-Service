@@ -23,6 +23,16 @@ FUTURE_WORDS = re.compile(
     r"行きます|します|するつもり|しよう|will|plan|remind|notify|tomorrow|next\s",
     re.I,
 )
+NEGATED_FUTURE_WORDS = re.compile(
+    r"(?:予定|リマインド|思い出させ|通知|登録|設定|予約|実行)"
+    r".{0,20}(?:できない|できません|しない|しません|ではない|ではありません|"
+    r"はない|はありません|取り消|取消|キャンセル|無効|期限切れ)|"
+    r"(?:cannot|can't|will\s+not|won't|do\s+not|don't|unable\s+to|cancel(?:led)?|expired)"
+    r".{0,24}(?:plan|remind|notify|schedule|register|set|book|execute)|"
+    r"(?:plan|remind|notify|schedule|register|set|book|execute)"
+    r".{0,24}(?:cannot|can't|will\s+not|won't|do\s+not|don't|unable|cancel(?:led)?|expired)",
+    re.I,
+)
 CURRENT_DATE_WORDS = re.compile(
     r"(?:今日|本日)(?:は|の日付は|の日付が)?|current date|today is",
     re.I,
@@ -81,11 +91,20 @@ class TemporalGate:
                     continue
                 is_current = bool(CURRENT_DATE_WORDS.search(sentence))
                 is_past_statement = bool(PAST_WORDS.search(sentence))
-                is_future_statement = bool(FUTURE_WORDS.search(sentence)) and not is_past_statement
+                is_negated_future = bool(NEGATED_FUTURE_WORDS.search(sentence))
+                is_future_statement = (
+                    bool(FUTURE_WORDS.search(sentence))
+                    and not is_past_statement
+                    and not is_negated_future
+                )
                 if is_current:
                     status = "verified" if target == today else "contradicted"
                     reason = "matches_current_date" if status == "verified" else "current_date_mismatch"
                     relation = "current"
+                elif is_negated_future:
+                    status = "verified"
+                    reason = "future_action_negated"
+                    relation = "negated_future"
                 elif is_future_statement:
                     status = "verified" if target >= today else "contradicted"
                     reason = "future_date_consistent" if status == "verified" else "future_action_date_is_past"
