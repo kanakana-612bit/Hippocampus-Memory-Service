@@ -17,8 +17,14 @@ Inferred memories are tentative: do not present them as certain facts, and avoid
 
 Recommended behavior:
 
-- Send the previous assistant turn and latest user turn to `/memory/ingest`.
-- Use stable source event IDs so retries do not create duplicate traces.
+- Send the previous assistant turn on the active path and the latest user turn
+  to `/memory/ingest`.
+- Derive an immutable event ID from the frontend message ID and a content
+  digest. Retries of identical content reuse the same event ID, while an edited
+  message becomes a new version instead of rewriting its provenance.
+- Do not immediately ingest every generated assistant sibling. Ingest an
+  assistant response when the next user turn proves that it is on the active
+  conversation path.
 - Leave `auto_capture=true`; automatically extracted items remain inferred
   short-term candidates.
 - Call Hippocampus with the latest user message as `query`.
@@ -44,6 +50,7 @@ Example environment switches for an OpenWebUI integration:
 ```env
 HIPPOCAMPUS_HOOK_ENABLED=1
 HIPPOCAMPUS_AUTO_CAPTURE_ENABLED=1
+HIPPOCAMPUS_CAPTURE_ASSISTANT_IMMEDIATELY=0
 HIPPOCAMPUS_URL=http://127.0.0.1:8091
 HIPPOCAMPUS_TIMEZONE=UTC
 HIPPOCAMPUS_TIMEOUT_SECONDS=2.5
@@ -102,6 +109,10 @@ available to the frontend. Do not infer or synthesize an identity. The `role`,
 later summary cannot silently turn assistant-authored text into a user claim.
 Reusing an existing source event ID with different content, conversation, role,
 or actor attribution is rejected as a provenance conflict.
+For an editable frontend, a practical event ID is
+`<source_message_id>:v:<content_digest>`. Preserve the unsuffixed frontend ID
+and digest in event metadata so revisions can be grouped without losing the
+immutable record.
 
 ## Response Attribution Gate
 
@@ -112,7 +123,9 @@ something. These markers are machine-readable evidence references and are
 removed before the final response is displayed.
 
 For a gated response, the OpenWebUI integration buffers the draft and calls
-`POST /response/candidates/select`. Hippocampus applies two narrow checks:
+`POST /response/candidates/select`. The request includes the latest user text as
+the optional `request_content` field so the gate can compare the draft with the
+time constraints it is answering. Hippocampus applies two narrow checks:
 
 - a matching audited original event can verify a direct speech claim;
 - a confirmed explicit memory can support a request, preference, belief, or
@@ -124,6 +137,11 @@ For a gated response, the OpenWebUI integration buffers the draft and calls
   timezone;
 - a past date cannot be presented as a pending future reminder, while a
   correctly worded historical event remains allowed.
+- a date in one sentence can inherit a reminder or notification commitment from
+  the adjacent sentence;
+- when the user request itself conflicts, such as `tomorrow` paired with an
+  already-past absolute date, the draft must identify the conflict and ask for
+  clarification instead of silently choosing or accepting either date.
 
 If the first candidate is contradicted or unverified, OpenWebUI requests a new
 candidate with narrow correction feedback and validates it again. The recovery
@@ -136,6 +154,10 @@ The recommended defaults are three retries and 30 seconds. Transport failures
 retry the deterministic validation before asking the model for another draft;
 changing the text cannot repair an unavailable validator. A regenerated draft
 is never displayed until it passes both enabled gates.
+
+Regeneration receives the structured gate findings but not the full rejected
+draft. This avoids anchoring a small model to a known-bad date or attribution
+and reduces paraphrased repetitions of the same failure.
 
 If no candidate passes, the integration stores `status=failed` and
 `decision=validation_failed` with the retry count, elapsed time, reason, and a

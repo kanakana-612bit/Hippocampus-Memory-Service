@@ -439,6 +439,7 @@ class ResponseCandidateIn(BaseModel):
 
 class CandidateSelectRequest(BaseModel):
     candidates: list[ResponseCandidateIn] = Field(min_length=1, max_length=12)
+    request_content: str | None = Field(default=None, max_length=100000)
     conversation_id: str | None = None
     event_ids: list[str] = Field(default_factory=list, max_length=200)
     memory_ids: list[str] = Field(default_factory=list, max_length=100)
@@ -450,6 +451,7 @@ class CandidateSelectRequest(BaseModel):
 
 class TemporalValidateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100000)
+    request_content: str | None = Field(default=None, max_length=100000)
     as_of: str | None = None
     timezone: str | None = None
 
@@ -578,6 +580,7 @@ def validate_response_attribution(req: AttributionValidateRequest) -> dict[str, 
 def select_response_candidate(req: CandidateSelectRequest) -> dict[str, Any]:
     return manager.select_response_candidate(
         candidates=[candidate.model_dump(exclude_none=True) for candidate in req.candidates],
+        request_content=req.request_content,
         conversation_id=req.conversation_id,
         event_ids=req.event_ids,
         memory_ids=req.memory_ids,
@@ -593,6 +596,7 @@ def validate_response_temporal(req: TemporalValidateRequest) -> dict[str, Any]:
     try:
         return manager.validate_response_temporal(
             content=req.content,
+            request_content=req.request_content,
             as_of=req.as_of,
             timezone=req.timezone,
         )

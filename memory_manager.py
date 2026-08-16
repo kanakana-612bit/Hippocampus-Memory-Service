@@ -4390,6 +4390,7 @@ class MemoryManager:
         self,
         *,
         candidates: list[dict[str, Any]],
+        request_content: str | None = None,
         conversation_id: str | None = None,
         event_ids: list[str] | None = None,
         memory_ids: list[str] | None = None,
@@ -4422,6 +4423,7 @@ class MemoryManager:
             temporal_started = time.monotonic()
             temporal = self.temporal_gate.validate_candidate(
                 content=content,
+                request_content=request_content,
                 as_of=as_of,
                 timezone_name=zone,
             ) if validate_temporal else {
@@ -4501,11 +4503,13 @@ class MemoryManager:
         self,
         *,
         content: str,
+        request_content: str | None = None,
         as_of: str | None = None,
         timezone: str | None = None,
     ) -> dict[str, Any]:
         return self.temporal_gate.validate_candidate(
             content=content,
+            request_content=request_content,
             as_of=as_of,
             timezone_name=timezone_name(timezone or self.default_timezone),
         )

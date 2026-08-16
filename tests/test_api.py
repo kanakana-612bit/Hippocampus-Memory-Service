@@ -375,6 +375,38 @@ class LayeredMemoryApiTests(unittest.TestCase):
         status = self.client.get("/status/attribution-gate")
         self.assertTrue(status.json()["complete"])
 
+    def test_candidate_selection_checks_request_temporal_constraints(self) -> None:
+        response = self.client.post(
+            "/response/candidates/select",
+            json={
+                "request_content": (
+                    "明日の予定だけどさ、8/13に買い物に行くから、"
+                    "朝9時になったら教えて"
+                ),
+                "as_of": "2026-08-16T11:41:00+09:00",
+                "timezone": "Asia/Tokyo",
+                "candidates": [
+                    {
+                        "candidate_id": "primary",
+                        "content": (
+                            "2026年8月13日に買い物に行かれるのですね。"
+                            "午前9時になりましたらお知らせします。"
+                        ),
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["decision"], "regenerate")
+        self.assertTrue(
+            any(
+                item["reason"]
+                == "response_does_not_resolve_request_temporal_conflict"
+                for item in response.json()["regeneration_feedback"]
+            )
+        )
+
     def test_invalid_phase3_timestamp_returns_400(self) -> None:
         response = self.client.post(
             "/memory/ingest",

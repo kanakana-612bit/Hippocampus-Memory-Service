@@ -339,6 +339,57 @@ class HardeningTests(unittest.TestCase):
             "future_action_date_is_past",
         )
 
+    def test_temporal_gate_checks_cross_sentence_and_request_constraints(self) -> None:
+        as_of = "2026-08-16T11:41:00+09:00"
+        request_content = "明日の予定だけどさ、8/13に買い物に行くから、朝9時になったら教えて"
+        split_commitment = self.manager.validate_response_temporal(
+            content=(
+                "2026年8月13日の件ですね。"
+                "午前9時になりましたらお知らせします。"
+            ),
+            as_of=as_of,
+            timezone="Asia/Tokyo",
+        )
+        inherited_request = self.manager.validate_response_temporal(
+            content="承知しました。午前9時になりましたらお知らせします。",
+            request_content=request_content,
+            as_of=as_of,
+            timezone="Asia/Tokyo",
+        )
+        correction = self.manager.validate_response_temporal(
+            content=(
+                "8月13日は既に過ぎています。"
+                "明日は8月17日ですが、どちらの日付を希望するか確認させてください。"
+            ),
+            request_content=request_content,
+            as_of=as_of,
+            timezone="Asia/Tokyo",
+        )
+        valid_future = self.manager.validate_response_temporal(
+            content="8月20日の午前9時になりましたらお知らせします。",
+            request_content="8月20日に買い物へ行くので、午前9時に教えて",
+            as_of=as_of,
+            timezone="Asia/Tokyo",
+        )
+
+        self.assertEqual(split_commitment["decision"], "reject")
+        self.assertEqual(
+            split_commitment["claims"][0]["reason"],
+            "future_action_date_is_past",
+        )
+        self.assertEqual(inherited_request["decision"], "reject")
+        self.assertEqual(inherited_request["request_issue_count"], 2)
+        self.assertTrue(
+            all(
+                claim["reason"] == "response_does_not_resolve_request_temporal_conflict"
+                for claim in inherited_request["claims"]
+            )
+        )
+        self.assertEqual(correction["decision"], "allow")
+        self.assertEqual(correction["request_issue_count"], 2)
+        self.assertEqual(valid_future["decision"], "allow")
+        self.assertEqual(valid_future["request_issue_count"], 0)
+
     def test_supersession_marks_prospective_dependents_for_review(self) -> None:
         old_trace = self.manager.create_memory_trace(
             {"content": "Old schedule", "candidate_memory_type": "semantic", "event_time": "2026-08-01T00:00:00Z"}

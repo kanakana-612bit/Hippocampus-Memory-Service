@@ -546,7 +546,12 @@ code belongs on `Private`; runtime data belongs in neither branch.
 
 Memory-domain phases 1 through 5, the two-stage extraction pipeline, request
 idempotency, response attribution gate, explicit-date temporal gate, hybrid
-conversation segmentation, and the segmented nightly runner are implemented. Existing
+conversation segmentation, and the segmented nightly runner are implemented. The
+temporal gate checks adjacent-sentence references and can compare a candidate with
+the optional original `request_content`, while keeping general factuality outside
+its scope. The OpenWebUI integration guidance versions edited source messages and
+delays assistant ingestion until a response is confirmed as the active predecessor,
+so manual regeneration branches do not all become nightly context. Existing
 episodic/project/persistent rows are projected into the canonical long-term
 table at startup while legacy routes remain available. Back up a real SQLite
 database before first migration.
