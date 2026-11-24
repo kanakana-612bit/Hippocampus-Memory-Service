@@ -1,54 +1,40 @@
-from __future__ import annotations
-
+"""Canonical authenticated nightly client. Old extraction/budget flags are rejected."""
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from v02.host import Client
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from memory_manager import MemoryManager  # noqa: E402
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Hippocampus nightly extraction and maintenance.")
-    parser.add_argument("--since-hours", type=int, default=36)
-    parser.add_argument("--conversation-id")
-    parser.add_argument("--limit", type=int, default=120)
-    parser.add_argument("--model")
-    parser.add_argument("--session-gap-minutes", type=int, default=90)
-    parser.add_argument("--context-tokens", type=int, default=12000)
-    parser.add_argument("--overlap-turns", type=int, default=2)
-    parser.add_argument("--topic-boundary-threshold", type=float, default=0.68)
-    parser.add_argument("--no-boundary-slm", action="store_true")
-    parser.add_argument("--auto-consolidate", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--client-file', default=os.getenv('HIPPOCAMPUS_V02_CLIENT_FILE'))
+    parser.add_argument('--user-id')
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument('--conversation-id')
+    scope.add_argument('--all-conversations', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
-
-    manager = MemoryManager()
-    try:
-        result = manager.run_nightly_cycle(
-            since_hours=args.since_hours,
-            conversation_id=args.conversation_id,
-            limit=args.limit,
-            model=args.model,
-            auto_consolidate=args.auto_consolidate,
-            dry_run=args.dry_run,
-            session_gap_minutes=args.session_gap_minutes,
-            context_tokens=args.context_tokens,
-            overlap_turns=args.overlap_turns,
-            topic_boundary_threshold=args.topic_boundary_threshold,
-            use_boundary_slm=not args.no_boundary_slm,
-        )
-    except Exception as exc:
-        print(json.dumps({"status": "failed", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
-        return 1
-    print(json.dumps(result, ensure_ascii=False))
+    if not args.client_file:
+        parser.error('Configure --client-file or HIPPOCAMPUS_V02_CLIENT_FILE')
+    config = json.loads(Path(args.client_file).read_text(encoding='utf-8-sig'))
+    users = config['users']
+    if args.user_id:
+        users = {args.user_id: users[args.user_id]}
+    results = []
+    for user, entry in users.items():
+        client = Client(config['url'], entry['token'], entry['principal_id'])
+        paths = client.request('GET', '/records?kind=path')
+        conversations = [p['conversation_id'] for p in paths
+                         if not args.conversation_id or p['conversation_id'] == args.conversation_id]
+        for conversation in conversations:
+            result = {'dry_run': True} if args.dry_run else client.request('POST', '/nightly/run', {'conversation_id': conversation})
+            results.append({'principal_id': entry['principal_id'], 'conversation_id': conversation, 'result': result})
+    print(json.dumps({'mode': 'canonical_deterministic_reassessment', 'results': results}, ensure_ascii=False))
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

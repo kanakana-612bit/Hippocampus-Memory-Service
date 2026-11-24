@@ -1,0 +1,79 @@
+{
+  "format": "hippocampus.evaluation.fixture.v1",
+  "synthetic": true,
+  "data_origin": "new_fictional_fixture",
+  "as_of": "2026-09-01T12:00:00Z",
+  "template_id": "k5-fixed-fields-v2",
+  "system_prompt": "This is a fictional evaluation. Answer only from the provided memory context. Return exactly one bare JSON object with five string fields: answer, actor, condition, scope, certainty. No Markdown fences, explanations or extra fields. answer: the lowercase bicycle color, or unknown. actor: the named person who reported borrowing it, or unknown. condition: exactly rainy_morning, sunny_evening, or unknown. scope: exactly single_event or unknown. certainty: exactly reported or unknown. Use reported when the only source is a person's report; it does not mean independently verified. A large retrieval_weight or salience is not proof of truth or a general habit. If no relevant memory context is provided, every field must be unknown even if a name occurs in the question. Do not infer hidden information.",
+  "steps": [
+    {
+      "name": "sync",
+      "method": "POST",
+      "route": "/dialogue/sync",
+      "body": {
+        "conversation_id": "eval:chat",
+        "messages": [
+          {"id": "eval:source", "role": "user", "actor_id": "eval:narrator", "content": "Fictional demo: Mira reported borrowing a blue bicycle from Sol on one rainy morning. This is a single reported event, not an established habit or independently verified fact.", "event_time": "2026-09-01T11:00:00Z"},
+          {"id": "eval:question", "role": "user", "content": "What bicycle color did Mira report, in which condition, and with what scope and certainty?", "event_time": "2026-09-01T12:00:00Z"}
+        ],
+        "active_event_ids": ["eval:source", "eval:question"],
+        "revision_key": "r1",
+        "expected_revision": null,
+        "auto_capture": false
+      }
+    },
+    {
+      "name": "memory",
+      "method": "POST",
+      "route": "/memories",
+      "body": {
+        "idempotency_key": "eval:memory:create",
+        "reason": "New fictional evaluation fixture",
+        "memory": {
+          "id": "eval:memory",
+          "conversation_id": "eval:chat",
+          "content": "Mira reported borrowing a blue bicycle from Sol on one rainy morning. Single reported event; no independent verification and no evidence of a general habit.",
+          "source_event_ids": ["eval:source"],
+          "keywords": ["Mira", "bicycle", "blue", "rainy"],
+          "retrieval_weight": 0.2,
+          "salience": 0.2,
+          "event_time": "2026-09-01T11:00:00Z",
+          "usage_scope": "episode_only"
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "baseline_no_injection",
+      "question": "What bicycle color did Mira report, in which condition, and with what scope and certainty?",
+      "condition": "Phase 1: same selected memory, host omits the packet",
+      "inject_packet": false,
+      "knowledge_mode": "disabled",
+      "rubric": {"expected": {"answer": ["unknown"], "actor": ["unknown"], "condition": ["unknown"], "scope": ["unknown"], "certainty": ["unknown"]}}
+    },
+    {
+      "id": "episodic_context",
+      "question": "What bicycle color did Mira report, in which condition, and with what scope and certainty?",
+      "condition": "Phase 1: selected episodic memory is injected",
+      "knowledge_mode": "disabled",
+      "rubric": {"expected": {"answer": ["blue"], "actor": ["Mira"], "condition": ["rainy_morning"], "scope": ["single_event"], "certainty": ["reported"]}}
+    },
+    {
+      "id": "high_salience",
+      "question": "What bicycle color did Mira report, in which condition, and with what scope and certainty?",
+      "condition": "Phase 2: salience changes alone; certainty and episode scope should remain",
+      "knowledge_mode": "disabled",
+      "steps": [{"name": "salience", "method": "PATCH", "route": "/memories/eval:memory/weights", "body": {"expected_version": 1, "idempotency_key": "eval:salience", "reason": "Fictional salience ablation", "salience": 0.99}}],
+      "rubric": {"expected": {"answer": ["blue"], "actor": ["Mira"], "condition": ["rainy_morning"], "scope": ["single_event"], "certainty": ["reported"]}}
+    },
+    {
+      "id": "high_retrieval_weight",
+      "question": "What bicycle color did Mira report, in which condition, and with what scope and certainty?",
+      "condition": "Phase 2: retrieval_weight changes alone; certainty and episode scope should remain",
+      "knowledge_mode": "disabled",
+      "steps": [{"name": "retrieval", "method": "PATCH", "route": "/memories/eval:memory/weights", "body": {"expected_version": 1, "idempotency_key": "eval:retrieval", "reason": "Fictional retrieval ablation", "retrieval_weight": 0.99}}],
+      "rubric": {"expected": {"answer": ["blue"], "actor": ["Mira"], "condition": ["rainy_morning"], "scope": ["single_event"], "certainty": ["reported"]}}
+    }
+  ]
+}

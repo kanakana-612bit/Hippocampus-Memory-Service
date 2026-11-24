@@ -1,5 +1,20 @@
 # LLMに「思い出」を持たせるための記憶設計
 
+2026-11-25 公開整理: 本文は旧v2設計の履歴です。現行の公開本体は
+[Ver0.2の正規契約](ver0.2-implementation.ja.md)と
+[多段階エピソード記憶・schema 5](episodic-memory-multiresolution.ja.md)を参照してください。
+[Ver1.0](../v1/README.ja.md)は別DB・別APIを持つ架空データ用の開発基盤です。
+以下の旧ゲート・予算・APIの記述を、新版の契約へ暗黙に適用しません。
+
+## 現行経路への改定
+
+通常応答は[Context Compiler v2](context-compiler-migration.ja.md)へ移行した。
+この改定が、以下の旧応答ゲート・リアルタイムSLM・次ターンまでの保存延期の記述に優先する。
+正史と候補監査の分離、logical actorとmodel provenance、原文永続保存、
+外部設定可能な予算と1000トークンのテンプレート予約を実装した。
+旧比較APIは明示的な実験設定でのみ利用する。コンパイラの原文保持と来歴検証は、
+LLMの意味解釈の正しさを保証するものではない。
+
 > Hippocampus Memory Service 公開設計概要  
 > 文書状態: 公開用ドラフト  
 > 更新日: 2026-08-12

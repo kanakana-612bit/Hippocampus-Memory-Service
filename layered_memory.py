@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dialogue_store import sources_eligible, reject_candidate_sources
 
 import json
 import math
@@ -1608,6 +1609,7 @@ class LayeredMemoryStore:
         con: sqlite3.Connection | None = None,
         only_if_missing: bool = False,
     ) -> bool:
+        reject_candidate_sources(item)
         own = con is None
         con = con or self.connect()
         try:
@@ -1783,6 +1785,7 @@ class LayeredMemoryStore:
                 con.close()
 
     def create_trace(self, item: dict[str, Any]) -> dict[str, Any]:
+        reject_candidate_sources(item)
         trace_stage = str(item.get("trace_stage", "proto"))
         if trace_stage not in TRACE_STAGES:
             raise ValueError(f"Unknown trace_stage: {trace_stage}")
@@ -1991,6 +1994,7 @@ class LayeredMemoryStore:
         return [self.trace_row(row) for row in rows]
 
     def patch_trace(self, trace_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        reject_candidate_sources(patch)
         allowed = {
             "trace_stage",
             "candidate_memory_type",
@@ -2279,6 +2283,8 @@ class LayeredMemoryStore:
         con = con or self.connect()
         try:
             trace = self.get_trace(trace_id, con=con)
+            if not sources_eligible(con, trace):
+                raise ValueError('Noncanonical dialogue cannot be consolidated')
             if trace["status"] == "consolidated" and trace.get("consolidated_memory_id"):
                 return self.get_memory(trace["consolidated_memory_id"], con=con)
             if trace["status"] == "archived":
@@ -2455,7 +2461,7 @@ class LayeredMemoryStore:
                 report["traces_decayed"] += 1
                 if status == "archived":
                     con.execute("DELETE FROM memory_trace_fts WHERE trace_id=?", (trace["id"],))
-                elif auto_consolidate and score >= trace["record_threshold"] and trace.get("candidate_memory_type"):
+                elif auto_consolidate and score >= trace["record_threshold"] and trace.get("candidate_memory_type") and sources_eligible(con, trace):
                     memory = self.consolidate_trace(trace["id"], con=con)
                     report["traces_consolidated"] += 1
                     report["consolidated_memory_ids"].append(memory["id"])
@@ -2597,6 +2603,7 @@ class LayeredMemoryStore:
             params.append(as_of)
 
     def patch_memory(self, memory_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        reject_candidate_sources(patch)
         allowed = {
             "memory_type",
             "title",
@@ -2955,6 +2962,8 @@ class LayeredMemoryStore:
             rows = con.execute(f"SELECT * FROM memories WHERE {' AND '.join(clauses)}", params).fetchall()
             for row in rows:
                 memory = self.memory_row(row)
+                if not sources_eligible(con, memory):
+                    continue
                 memory["temporal_status"] = temporal_state(memory, reference)
                 keyword = self.keyword_score(query_normalized, terms, memory, fts_hits)
                 if keyword <= 0.0:
@@ -3121,12 +3130,14 @@ class LayeredMemoryStore:
             "SELECT memory_id, rank FROM long_term_memory_fts WHERE long_term_memory_fts MATCH ? ORDER BY rank LIMIT 50",
             (expr,),
         ).fetchall()
-        return {row["memory_id"]: 1.0 / (1.0 + abs(float(row["rank"]))) for row in rows}
+        return {row['memory_id']: 1.0 / (1.0 + abs(float(row['rank']))) for row in rows
+                if (item := con.execute('SELECT * FROM memories WHERE id=?', (row['memory_id'],)).fetchone())
+                and sources_eligible(con, dict(item))}
 
     def index_trace(self, con: sqlite3.Connection, trace_id: str) -> None:
         row = con.execute("SELECT * FROM memory_traces WHERE id=?", (trace_id,)).fetchone()
         con.execute("DELETE FROM memory_trace_fts WHERE trace_id=?", (trace_id,))
-        if row is None or row["status"] in {"archived", "consolidated"}:
+        if row is None or row["status"] in {"archived", "consolidated"} or not sources_eligible(con, dict(row)):
             return
         con.execute(
             "INSERT INTO memory_trace_fts(trace_id, title, content, keywords) VALUES (?,?,?,?)",
@@ -3136,7 +3147,7 @@ class LayeredMemoryStore:
     def index_memory(self, con: sqlite3.Connection, memory_id: str) -> None:
         row = con.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         con.execute("DELETE FROM long_term_memory_fts WHERE memory_id=?", (memory_id,))
-        if row is None or row["archived"]:
+        if row is None or row["archived"] or not sources_eligible(con, dict(row)):
             return
         con.execute(
             "INSERT INTO long_term_memory_fts(memory_id, memory_type, title, content, keywords) VALUES (?,?,?,?,?)",

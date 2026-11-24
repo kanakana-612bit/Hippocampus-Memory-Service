@@ -141,7 +141,10 @@ def request_temporal_issues(text: str | None, reference: datetime) -> list[dict[
     return unique
 
 
-def candidate_resolves_request_issue(content: str) -> bool:
+def candidate_resolves_request_issue(
+    content: str,
+    resolution_signals: list[dict[str, Any]] | None = None,
+) -> bool:
     sentences = sentence_spans(content)
     has_affirmative_commitment = any(
         FUTURE_COMMITMENT_WORDS.search(sentence)
@@ -153,7 +156,86 @@ def candidate_resolves_request_issue(content: str) -> bool:
         or PAST_AWARENESS_WORDS.search(content)
         or CLARIFICATION_WORDS.search(content)
     )
+    if resolution_signals:
+        kinds = {
+            str(signal.get("kind") or "")
+            for signal in resolution_signals
+            if signal.get("source") == "response"
+        }
+        acknowledges_problem = acknowledges_problem or bool(
+            kinds
+            & {
+                "past_awareness",
+                "conflict_acknowledgement",
+                "clarification",
+                "future_negation",
+            }
+        )
+        has_affirmative_commitment = (
+            has_affirmative_commitment or "future_commitment" in kinds
+        )
     return acknowledges_problem and not has_affirmative_commitment
+
+
+def safe_request_clarification(
+    request_content: str | None,
+    reference: datetime,
+) -> str | None:
+    issues = request_temporal_issues(request_content, reference)
+    if not issues:
+        return None
+    mismatch = next(
+        (
+            issue
+            for issue in issues
+            if issue.get("reason") == "request_relative_absolute_date_mismatch"
+        ),
+        None,
+    )
+    past_issue = next(
+        (
+            issue
+            for issue in issues
+            if issue.get("reason") == "request_future_action_date_is_past"
+        ),
+        None,
+    )
+    request_text = request_content or ""
+    japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", request_text))
+
+    if mismatch:
+        expression = str(mismatch.get("expression") or "")
+        relative, _, absolute = expression.partition(" / ")
+        expected = str(mismatch.get("expected_date") or "")
+        resolved = str(mismatch.get("resolved_date") or "")
+        if japanese:
+            parts = [f"「{relative or '相対日付'}」に当たる日付は{expected}です。"]
+            if absolute and resolved:
+                parts.append(f"指定された「{absolute}」は{resolved}です。")
+            if past_issue:
+                parts.append("その指定日はすでに過ぎています。")
+            parts.append("どちらの日付を意図しているか確認させてください。")
+            return "".join(parts)
+        parts = [f"The date corresponding to {relative or 'the relative date'} is {expected}."]
+        if absolute and resolved:
+            parts.append(f" The supplied date {absolute} resolves to {resolved}.")
+        if past_issue:
+            parts.append(" That supplied date has already passed.")
+        parts.append(" Please clarify which date you intended.")
+        return "".join(parts)
+
+    issue = past_issue or issues[0]
+    expression = str(issue.get("expression") or "the supplied date")
+    resolved = str(issue.get("resolved_date") or "")
+    if japanese:
+        return (
+            f"指定された「{expression}」は{resolved}で、すでに過ぎています。"
+            "別の日付を意図しているか確認させてください。"
+        )
+    return (
+        f"The supplied date {expression} resolves to {resolved} and has already passed. "
+        "Please clarify whether you intended a different date."
+    )
 
 
 class TemporalGate:
@@ -164,6 +246,7 @@ class TemporalGate:
         request_content: str | None = None,
         as_of: str | None = None,
         timezone_name: str = "UTC",
+        resolution_signals: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         reference = local_reference(as_of, timezone_name)
         today = reference.date()
@@ -233,8 +316,9 @@ class TemporalGate:
                     }
                 )
         request_issues = request_temporal_issues(request_content, reference)
+        rule_resolved = candidate_resolves_request_issue(content)
         if request_issues:
-            resolved = candidate_resolves_request_issue(content)
+            resolved = candidate_resolves_request_issue(content, resolution_signals)
             for issue in request_issues:
                 claims.append(
                     {
@@ -266,6 +350,22 @@ class TemporalGate:
             "claim_counts": counts,
             "claims": claims,
             "request_issue_count": len(request_issues),
+            "request_issues": request_issues,
+            "request_resolution": {
+                "resolved": bool(request_issues and resolved),
+                "detection": (
+                    "deterministic_rules"
+                    if request_issues and rule_resolved
+                    else "slm_structure_v1"
+                    if request_issues and resolved
+                    else "none"
+                ),
+                "signals": resolution_signals or [],
+            },
+            "safe_request_clarification": safe_request_clarification(
+                request_content,
+                reference,
+            ),
             "as_of": reference.isoformat(timespec="seconds"),
             "timezone": timezone_name,
             "policy_scope": (

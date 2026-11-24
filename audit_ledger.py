@@ -11,6 +11,8 @@ from typing import Any
 GENESIS_HASH = "0" * 64
 LEDGER_FORMAT = "hippocampus-audit-v1"
 OBJECT_TABLES = {
+    "dialogue_event": "dialogue_events",
+    "dialogue_path": "dialogue_path_events",
     "raw_message": "raw_messages",
     "memory_trace": "memory_traces",
     "memory": "memories",

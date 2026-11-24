@@ -50,6 +50,8 @@ from temporal_memory import (
     validate_window,
 )
 from temporal_gate import TemporalGate
+from context_compiler import compile_context, VERSION as CONTEXT_VERSION
+from dialogue_store import initialize as initialize_dialogue, register_event, select_path, CandidateAuditStore, sources_eligible
 
 try:
     import yaml
@@ -88,6 +90,39 @@ STRUCTURED_CLAIM_SCHEMA: dict[str, Any] = {
         }
     },
     "required": ["claims"],
+    "additionalProperties": False,
+}
+
+TEMPORAL_SIGNAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "signals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["request", "response"],
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "past_awareness",
+                            "conflict_acknowledgement",
+                            "clarification",
+                            "future_commitment",
+                            "future_negation",
+                        ],
+                    },
+                    "evidence_text": {"type": "string"},
+                },
+                "required": ["source", "kind", "evidence_text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["signals"],
     "additionalProperties": False,
 }
 
@@ -280,6 +315,7 @@ class MemoryManager:
         self.default_timezone = timezone_name(os.getenv("HIPPOCAMPUS_TIMEZONE", "UTC"))
         self.layered = LayeredMemoryStore(self.db_path)
         self.temporal_gate = TemporalGate()
+        self.candidate_audit = CandidateAuditStore(self.db_path.with_name(self.db_path.stem + '.candidate-audit.db'))
         self.init_db()
 
     def connect(self) -> sqlite3.Connection:
@@ -291,6 +327,7 @@ class MemoryManager:
     def init_db(self) -> None:
         with self.connect() as con:
             con.executescript((ROOT / "schema.sql").read_text(encoding="utf-8"))
+            initialize_dialogue(con)
             self.layered.initialize(con)
         self.layered.ensure_phase5_ready()
 
@@ -742,8 +779,11 @@ class MemoryManager:
         capture_threshold: float = DEFAULT_CAPTURE_THRESHOLD,
         default_timezone: str | None = None,
         idempotency_key: str | None = None,
+        defer_capture: bool = False,
     ) -> dict[str, Any]:
         started_monotonic = time.monotonic()
+        if any(str(m.get('id', '')).startswith('candidate_audit:') or (m.get('meta') or {}).get('record_kind') == 'generation_candidate' for m in messages):
+            raise ValueError('Generation candidates must use the separate audit store')
         threshold = clamp(capture_threshold)
         batch_timezone = timezone_name(default_timezone or self.default_timezone)
         request_digest = hashlib.sha256(
@@ -787,18 +827,22 @@ class MemoryManager:
                     incoming_ids,
                 ).fetchall()
                 existing_messages = {str(row["id"]): dict(row) for row in existing_rows}
-                existing_message_ids = set(existing_messages)
+                existing_message_ids = {
+                    row[0] for row in con.execute(
+                        "SELECT source_event_id FROM extraction_decisions WHERE decision != 'deferred'"
+                    )
+                }
             prior_rows = con.execute(
                 """
                 SELECT id, conversation_id, role, content, event_time, received_at,
                        persisted_at, source_time, timezone, time_source,
                        event_sequence, ingest_delay_seconds, created_at
-                FROM raw_messages
+                FROM canonical_dialogue_events
                 ORDER BY persisted_at DESC, created_at DESC
                 LIMIT 400
                 """
             ).fetchall()
-            prior_messages = [dict(row) for row in reversed(prior_rows)]
+            prior_messages = [dict(row) for row in reversed(prior_rows) if row['id'] not in incoming_ids]
             next_sequence = int(
                 con.execute(
                     "SELECT COALESCE(MAX(event_sequence), 0) FROM raw_messages WHERE conversation_id=?",
@@ -941,16 +985,29 @@ class MemoryManager:
                         payload={"conversation_id": conversation_id, "role": actor_role},
                     )
                 normalized_messages.append(normalized)
+                register_event(con, normalized)
 
         persistent: list[str] = []
         explicit_message_ids: set[str] = set()
-        for message in normalized_messages:
+        with self.connect() as con:
+            canonical_ids = {r[0] for r in con.execute('SELECT id FROM canonical_dialogue_events WHERE conversation_id=?', (conversation_id,))}
+        capture_messages = [] if defer_capture else [m for m in normalized_messages if m['id'] in canonical_ids]
+        for message in capture_messages:
             if message["role"] != "user":
                 continue
             explicit = self.extract_explicit_memory(message["content"])
             if not explicit:
                 continue
             explicit_message_ids.add(message["id"])
+            if message['id'] in existing_message_ids:
+                with self.connect() as con:
+                    persistent.extend(r[0] for r in con.execute(
+                        "SELECT id FROM memories WHERE acquisition_mode='user_explicit' AND archived=0 AND "
+                        "(json_extract(source_json, '$.message_id')=? OR EXISTS "
+                        "(SELECT 1 FROM json_each(source_event_ids_json) WHERE value=?))",
+                        (message['id'], message['id']),
+                    ))
+                continue
             remembered = self.remember(
                 content=explicit,
                 title=explicit[:40],
@@ -994,7 +1051,7 @@ class MemoryManager:
         if auto_capture:
             capture = self.capture_automatic_memories(
                 conversation_id=conversation_id,
-                messages=normalized_messages,
+                messages=capture_messages,
                 prior_messages=prior_messages,
                 existing_message_ids=existing_message_ids,
                 explicit_message_ids=explicit_message_ids,
@@ -1069,10 +1126,14 @@ class MemoryManager:
                 trace_ids = [str(detail["trace_id"])] if detail.get("trace_id") else []
                 con.execute(
                     """
-                    INSERT OR IGNORE INTO extraction_decisions
+                    INSERT INTO extraction_decisions
                     (decision_id, source_event_id, conversation_id, extractor,
                      extractor_version, decision, score, reason, trace_ids_json, created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(source_event_id, extractor, extractor_version) DO UPDATE SET
+                        decision=excluded.decision, score=excluded.score, reason=excluded.reason,
+                        trace_ids_json=excluded.trace_ids_json
+                    WHERE extraction_decisions.decision='deferred' AND excluded.decision!='deferred'
                     """,
                     (
                         new_id("decision"),
@@ -1251,6 +1312,9 @@ class MemoryManager:
     ) -> dict[str, Any] | None:
         best: tuple[float, dict[str, Any]] | None = None
         for trace in self.layered.list_traces(include_archived=False, limit=500):
+            with self.connect() as con:
+                if not sources_eligible(con, trace):
+                    continue
             if trace.get("status") not in {"active", "review"}:
                 continue
             if trace.get("candidate_memory_type") != candidate_memory_type:
@@ -1853,7 +1917,7 @@ class MemoryManager:
         with self.connect() as con:
             rows = con.execute(
                 f"""
-                SELECT * FROM raw_messages
+                SELECT * FROM canonical_dialogue_events
                 WHERE {' AND '.join(filters)}
                 ORDER BY conversation_id, event_time, event_sequence, created_at
                 LIMIT ?
@@ -2049,7 +2113,7 @@ class MemoryManager:
             rows = con.execute(
                 f"""
                 SELECT raw.*
-                FROM raw_messages AS raw
+                FROM canonical_dialogue_events AS raw
                 LEFT JOIN extraction_decisions AS decision
                   ON decision.source_event_id=raw.id
                  AND decision.extractor=?
@@ -2120,7 +2184,7 @@ class MemoryManager:
                 context_rows = con.execute(
                     """
                     SELECT * FROM (
-                        SELECT * FROM raw_messages
+                        SELECT * FROM canonical_dialogue_events
                         WHERE conversation_id=? AND event_time<=?
                         ORDER BY event_time DESC, event_sequence DESC, created_at DESC
                         LIMIT ?
@@ -2464,7 +2528,7 @@ class MemoryManager:
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
-                "SELECT id, title, created_at, updated_at, summary, chat FROM chat WHERE id=?",
+                "SELECT id, user_id, title, created_at, updated_at, summary, chat FROM chat WHERE id=?",
                 (chat_id,),
             ).fetchone()
         finally:
@@ -2473,40 +2537,19 @@ class MemoryManager:
             raise KeyError(f"OpenWebUI chat not found: {chat_id}")
 
         chat_json = json.loads(row["chat"] or "{}")
-        if branch == "all":
-            source_messages = list(((chat_json.get("history") or {}).get("messages") or {}).values())
-            source_messages.sort(key=lambda m: m.get("timestamp") or 0)
-        else:
-            source_messages = self.current_openwebui_branch(chat_json)
-            if not source_messages:
-                source_messages = chat_json.get("messages") or []
-
-        messages: list[dict[str, Any]] = []
-        for item in source_messages:
-            content = item.get("content") or item.get("output") or ""
-            if not str(content).strip():
-                continue
-            message_id = item.get("id") or new_id("openwebui_msg")
-            messages.append(
-                {
-                    "id": f"openwebui_{message_id}",
-                    "role": item.get("role", "user"),
-                    "content": str(content),
-                    "event_time": from_unix(item.get("timestamp") or row["created_at"]),
-                    "source_time": from_unix(item.get("timestamp") or row["created_at"]),
-                    "timezone": "UTC",
-                    "time_source": "openwebui_history",
-                    "created_at": from_unix(item.get("timestamp") or row["created_at"]),
-                    "meta": {
-                        "source": "openwebui",
-                        "openwebui_chat_id": chat_id,
-                        "openwebui_message_id": message_id,
-                        "title": row["title"],
-                        "model": item.get("model") or item.get("modelName"),
-                        "parent_id": item.get("parentId"),
-                    },
-                }
-            )
+        from openwebui_adapter import dialogue_payload
+        if not chat_json.get('history') and chat_json.get('messages'):
+            records, previous = {}, None
+            for index, item in enumerate(chat_json['messages']):
+                identity = str(item.get('id') or f'{chat_id}:legacy:{index}')
+                records[identity] = {**item, 'parentId': previous}
+                previous = identity
+            chat_json['history'] = {'messages': records, 'currentId': previous}
+        payload = dialogue_payload(chat_id, chat_json, row['user_id'],
+                                   logical_actor_id=os.getenv('HIPPOCAMPUS_LOGICAL_ACTOR_ID', 'assistant:primary'))
+        active_ids = payload['active_event_ids']
+        by_id = {event['id']: event for event in payload['messages']}
+        messages = payload['messages'] if branch == 'all' else [by_id[e] for e in active_ids]
 
         return {
             "id": row["id"],
@@ -2516,6 +2559,7 @@ class MemoryManager:
             "summary": row["summary"],
             "messages": messages,
             "branch": branch,
+            "active_event_ids": active_ids,
         }
 
     def current_openwebui_branch(self, chat_json: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2545,7 +2589,7 @@ class MemoryManager:
         max_chars: int = 24000,
     ) -> dict[str, Any]:
         chat = self.load_openwebui_chat(chat_id, webui_db_path=webui_db_path, branch=branch)
-        conversation_id = f"openwebui:{chat_id}:{branch}"
+        conversation_id = chat_id
         ingest = self.ingest_messages(
             conversation_id,
             chat["messages"],
@@ -2554,6 +2598,10 @@ class MemoryManager:
         )
         created: dict[str, list[str]] = {"daily_summaries": [], "episodic_memories": [], "project_memories": []}
         warnings: list[str] = []
+        self.select_dialogue_path(conversation_id, chat['active_event_ids'], new_id('import_path'))
+        chat['messages'] = [m for m in chat['messages'] if m['id'] in set(chat['active_event_ids'])]
+        if branch == 'all':
+            warnings.append('All displayed branches stored; only the selected path is eligible for learning.')
         if create_memories:
             if use_llm:
                 try:
@@ -2789,6 +2837,8 @@ class MemoryManager:
         messages: list[dict[str, str]],
         schema: dict[str, Any],
         max_tokens: int = 1200,
+        schema_name: str = "hippocampus_structured_claims",
+        timeout_env: str = "HIPPOCAMPUS_CLAIM_SLM_TIMEOUT_SECONDS",
     ) -> dict[str, Any]:
         provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
         model = self._slm_model()
@@ -2807,11 +2857,11 @@ class MemoryManager:
             messages=messages,
             temperature=0.0,
             max_tokens=max_tokens,
-            timeout=int(os.getenv("HIPPOCAMPUS_CLAIM_SLM_TIMEOUT_SECONDS", "90")),
+            timeout=int(os.getenv(timeout_env, "90")),
             response_format={
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "hippocampus_structured_claims",
+                    "name": schema_name,
                     "strict": True,
                     "schema": schema,
                 },
@@ -3044,6 +3094,118 @@ class MemoryManager:
                     candidate_digest,
                     "slm",
                     "structured_claim_v2",
+                    f"{provider}:{model}",
+                    dumps(result),
+                    utc_now(),
+                ),
+            )
+        return result
+
+    def extract_structured_temporal_signals(
+        self,
+        *,
+        request_content: str | None,
+        response_content: str,
+    ) -> dict[str, Any]:
+        provider = os.getenv("HIPPOCAMPUS_SLM_PROVIDER", "openai").strip().lower()
+        model = self._slm_model()
+        source_texts = {
+            "request": str(request_content or ""),
+            "response": str(response_content or ""),
+        }
+        digest_payload = dumps(source_texts)
+        candidate_digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(
+            f"temporal_signal_v1\0{provider}\0{model}\0{candidate_digest}".encode("utf-8")
+        ).hexdigest()
+        with self.connect() as con:
+            cached = con.execute(
+                "SELECT response_json FROM claim_extraction_cache WHERE cache_key=?",
+                (cache_key,),
+            ).fetchone()
+        if cached is not None:
+            result = loads(cached["response_json"], {})
+            result["cached"] = True
+            return result
+
+        prompt = (
+            "Extract only explicit temporal response signals from the request and response. "
+            "Do not decide whether any date is correct and do not repair the answer. "
+            "past_awareness means the text explicitly recognizes that a date or deadline is past; "
+            "conflict_acknowledgement means it explicitly notes incompatible date expressions; "
+            "clarification means it asks which date or time was intended; future_commitment means "
+            "it promises or accepts a future reminder, notification, schedule, or action; "
+            "future_negation means it explicitly refuses, cancels, or says it cannot perform that "
+            "future action. evidence_text must be an exact, contiguous substring of the indicated "
+            "source. Do not infer an unstated signal. Return an empty array when none applies.\n\n"
+            f"<request>\n{source_texts['request']}\n</request>\n"
+            f"<response>\n{source_texts['response']}\n</response>"
+        )
+        completion = self._structured_slm_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a narrow temporal-signal extractor. Return only data matching "
+                        "the supplied JSON schema. A deterministic gate makes every final decision."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            schema=TEMPORAL_SIGNAL_SCHEMA,
+            max_tokens=700,
+            schema_name="hippocampus_temporal_signals",
+            timeout_env="HIPPOCAMPUS_TEMPORAL_SLM_TIMEOUT_SECONDS",
+        )
+        payload = self.parse_json_object(str(completion.get("content") or ""))
+        signals: list[dict[str, str]] = []
+        allowed_kinds = {
+            "past_awareness",
+            "conflict_acknowledgement",
+            "clarification",
+            "future_commitment",
+            "future_negation",
+        }
+        for item in payload.get("signals") or []:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "").strip().lower()
+            kind = str(item.get("kind") or "").strip().lower()
+            evidence_text = str(item.get("evidence_text") or "").strip()
+            if source not in source_texts or kind not in allowed_kinds:
+                continue
+            if not evidence_text or evidence_text not in source_texts[source]:
+                continue
+            signals.append(
+                {
+                    "source": source,
+                    "kind": kind,
+                    "evidence_text": evidence_text[:1000],
+                }
+            )
+        result = {
+            "format": "hippocampus.temporal-signals.v1",
+            "signals": unique_list(signals),
+            "provider": completion.get("provider") or provider,
+            "model": completion.get("model") or model,
+            "duration_ms": float(completion.get("duration_ms") or 0.0),
+            "load_duration_ms": float(completion.get("load_duration_ms") or 0.0),
+            "prompt_eval_count": int(completion.get("prompt_eval_count") or 0),
+            "eval_count": int(completion.get("eval_count") or 0),
+            "cached": False,
+        }
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO claim_extraction_cache
+                (cache_key, candidate_digest, extractor, extractor_version, model, response_json, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    cache_key,
+                    candidate_digest,
+                    "slm",
+                    "temporal_signal_v1",
                     f"{provider}:{model}",
                     dumps(result),
                     utc_now(),
@@ -3312,6 +3474,7 @@ class MemoryManager:
         timezone: str | None = None,
         as_of: str | None = None,
         temporal_scope: str = "auto",
+        budget: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         zone = timezone_name(timezone or self.default_timezone)
         reference = normalize_timestamp(as_of or utc_now(), zone, field_name="as_of")
@@ -3322,37 +3485,6 @@ class MemoryManager:
             temporal_scope=scope,
             as_of=reference,
         )
-        stable = [
-            r
-            for r in retrieved
-            if r.memory.get("epistemic_status") == "confirmed"
-            or r.memory.get("acquisition_mode") == "user_explicit"
-        ]
-        stable_keys = {(r.memory_type, r.memory.get("id")) for r in stable}
-        projects = [
-            r for r in retrieved if r.memory_type == "prospective" and (r.memory_type, r.memory.get("id")) not in stable_keys
-        ]
-        episodes = [
-            r for r in retrieved if r.memory_type == "episodic" and (r.memory_type, r.memory.get("id")) not in stable_keys
-        ]
-
-        sections: list[str] = []
-        if stable:
-            sections.append("[Confirmed user memory]\n" + "\n".join(f"- {r.memory['content']}" for r in stable[:3]))
-        if projects:
-            sections.append("[Active project memory]\n" + "\n".join(f"- {r.memory['title']}: {r.memory['content']}" for r in projects[:3]))
-        if episodes:
-            lines = []
-            for r in episodes[:4]:
-                if r.inject_mode == "reference_only":
-                    lines.append(f"- {r.memory['title']}")
-                else:
-                    lines.append(f"- {r.memory['title']}: {r.memory['content']}")
-            sections.append("[Retrieved episodic memories]\n" + "\n".join(lines))
-        if include_recent_raw and conversation_id:
-            raw = self.recent_raw_messages(conversation_id, limit=6)
-            if raw:
-                sections.append("[Recent raw turns]\n" + "\n".join(f"- {m['role']}: {m['content']}" for m in raw))
 
         temporal = self.build_temporal_context(
             conversation_id=conversation_id,
@@ -3360,21 +3492,34 @@ class MemoryManager:
             as_of=reference,
         )
         attribution_evidence = self.build_attribution_evidence(retrieved)
-        memory_context = self.build_memory_context_block(
-            retrieved,
-            char_budget=char_budget,
-            temporal=temporal,
-            attribution_evidence=attribution_evidence,
+        evidence = self.canonical_transcript(conversation_id, limit=6) if conversation_id else []
+        evidence.reverse()
+        evidence_ids = {e['id'] for e in evidence}
+        for item in retrieved:
+            for event in self.canonical_evidence_for_memory(item.memory):
+                if event['id'] not in evidence_ids:
+                    evidence.append(event)
+                    evidence_ids.add(event['id'])
+        compiled = compile_context(
+            query=query,
+            orientation={k: temporal.get(k) for k in ('current_time', 'timezone', 'elapsed_since_latest', 'gap_before_latest')},
+            events=[self.context_event(e) for e in evidence],
+            memories=[{'id': r.memory['id'], 'content': r.memory.get('content', ''),
+                       'origin': r.memory.get('content_origin', 'derived'),
+                       'actor_role': r.memory.get('actor_role', 'unknown'),
+                       'source_event_ids': r.memory.get('source_event_ids', []),
+                       'epistemic_status': r.memory.get('epistemic_status', 'inferred')} for r in retrieved],
+            budget=budget, char_budget=char_budget,
         )
         return {
-            "context": "\n\n".join(sections),
-            "memory_context": memory_context,
+            "context": compiled['prompt_text'],
+            **compiled,
             "temporal_context": temporal,
             "attribution_evidence": attribution_evidence,
             "injection": {
                 "recommended_role": "system",
                 "placement": "after base system/persona instructions and before recent raw turns",
-                "estimated_chars": len(memory_context),
+                "estimated_chars": len(compiled['prompt_text']),
                 "char_budget": char_budget,
                 "result_count": len(retrieved),
                 "temporal_scope": scope,
@@ -3385,6 +3530,62 @@ class MemoryManager:
             "retrieved": [self.result_to_dict(r) for r in retrieved],
             "policy": "Memories are inserted as compact, source-aware context. Inferred memories should be treated as tentative, not as certain facts.",
         }
+
+    def select_dialogue_path(self, conversation_id: str, event_ids: list[str], revision_key: str,
+                             expected_revision: str | None = None) -> dict:
+        with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            result = select_path(con, conversation_id, event_ids, revision_key, expected_revision)
+            for row in con.execute('SELECT id FROM memory_traces').fetchall():
+                self.layered.index_trace(con, row[0])
+            for row in con.execute('SELECT id FROM memories').fetchall():
+                self.layered.index_memory(con, row[0])
+            return result
+
+    @staticmethod
+    def context_event(event: dict) -> dict:
+        from context_compiler import clean_display
+        result = {k: event.get(k) for k in ('id', 'logical_actor_id', 'actor_role', 'role', 'content_origin', 'model_provenance', 'event_time', 'time_source', 'content')}
+        result['content'] = clean_display(result['content'] or '')
+        return result
+
+    def canonical_transcript(self, conversation_id: str | None = None, limit: int = 100,
+                             query: str | None = None) -> list[dict]:
+        with self.connect() as con:
+            clauses, params = [], []
+            if conversation_id:
+                clauses.append('r.conversation_id=?')
+                params.append(conversation_id)
+            if query:
+                clauses.append('instr(lower(r.content), lower(?)) > 0')
+                params.append(query)
+            where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+            order = 'r.event_time DESC, r.event_sequence DESC'
+            if conversation_id:
+                order = "COALESCE((SELECT CAST(e.key AS INTEGER) FROM dialogue_path_events p, json_each(p.event_ids_json) e WHERE p.conversation_id=r.conversation_id AND e.value=r.id ORDER BY p.sequence DESC LIMIT 1), r.event_sequence) DESC"
+            rows = con.execute('SELECT r.*, d.logical_actor_id, d.model_provenance_json FROM canonical_dialogue_events r LEFT JOIN dialogue_events d ON r.id=d.id' + where + ' ORDER BY ' + order + ' LIMIT ?', (*params, min(1000, max(1, limit)))).fetchall()
+        events = []
+        for row in reversed(rows):
+            item = dict(row)
+            item['model_provenance'] = loads(item.pop('model_provenance_json'), {})
+            events.append(item)
+        return events
+
+    def canonical_evidence_for_memory(self, memory: dict) -> list[dict]:
+        from dialogue_store import source_ids
+        ids = source_ids(memory)
+        if not ids:
+            return []
+        with self.connect() as con:
+            if not sources_eligible(con, memory):
+                return []
+            rows = con.execute('SELECT r.*, d.logical_actor_id, d.model_provenance_json FROM canonical_dialogue_events r LEFT JOIN dialogue_events d ON r.id=d.id WHERE r.id IN (' + ','.join('?' for _ in ids) + ')', list(ids)).fetchall()
+        result = []
+        for row in rows:
+            event = dict(row)
+            event['model_provenance'] = loads(event.pop('model_provenance_json'), {})
+            result.append(event)
+        return result
 
     def build_temporal_context(
         self,
@@ -3405,7 +3606,7 @@ class MemoryManager:
                     """
                     SELECT id, role, event_time, received_at, persisted_at, source_time,
                            timezone, time_source, event_sequence, ingest_delay_seconds
-                    FROM raw_messages
+                    FROM canonical_dialogue_events
                     WHERE conversation_id=? AND event_time<=?
                     ORDER BY event_time DESC, event_sequence DESC
                     LIMIT 2
@@ -3420,7 +3621,7 @@ class MemoryManager:
                     """
                     SELECT id, role, event_time, received_at, persisted_at, source_time,
                            timezone, time_source, event_sequence, ingest_delay_seconds
-                    FROM raw_messages
+                    FROM canonical_dialogue_events
                     WHERE conversation_id=?
                     ORDER BY event_sequence DESC
                     LIMIT 1
@@ -3430,7 +3631,7 @@ class MemoryManager:
                 if ingested_row:
                     latest_ingested = dict(ingested_row)
                 first = con.execute(
-                    "SELECT MIN(event_time), count(*) FROM raw_messages WHERE conversation_id=? AND event_time<=?",
+                    "SELECT MIN(event_time), count(*) FROM canonical_dialogue_events WHERE conversation_id=? AND event_time<=?",
                     (conversation_id, reference),
                 ).fetchone()
                 started_at = first[0]
@@ -3585,7 +3786,7 @@ class MemoryManager:
         with self.connect() as con:
             raw_rows = (
                 con.execute(
-                    f"SELECT id, actor_role, role, content_origin, source_channel FROM raw_messages WHERE id IN ({','.join('?' for _ in event_ids)})",
+                    f"SELECT id, actor_role, role, content_origin, source_channel FROM canonical_dialogue_events WHERE id IN ({','.join('?' for _ in event_ids)})",
                     event_ids,
                 ).fetchall()
                 if event_ids
@@ -3743,7 +3944,7 @@ class MemoryManager:
                        event_sequence, ingest_delay_seconds, actor_id, actor_role,
                        source_channel, content_origin, extractor, derived_from_json,
                        latest_audit_event_id, latest_object_digest, created_at, meta_json
-                FROM raw_messages
+                FROM canonical_dialogue_events
                 WHERE conversation_id=?
                 ORDER BY event_sequence DESC, event_time DESC
                 LIMIT ?
@@ -3934,11 +4135,11 @@ class MemoryManager:
         with self.connect() as con:
             if conversation_id:
                 rows = con.execute(
-                    "SELECT * FROM raw_messages WHERE conversation_id=? AND substr(created_at,1,10)=? ORDER BY created_at",
+                    "SELECT * FROM canonical_dialogue_events WHERE conversation_id=? AND substr(created_at,1,10)=? ORDER BY created_at",
                     (conversation_id, date),
                 ).fetchall()
             else:
-                rows = con.execute("SELECT * FROM raw_messages WHERE substr(created_at,1,10)=? ORDER BY created_at", (date,)).fetchall()
+                rows = con.execute("SELECT * FROM canonical_dialogue_events WHERE substr(created_at,1,10)=? ORDER BY created_at", (date,)).fetchall()
             raw = [dict(row) for row in rows]
         topics: list[str] = []
         carry: list[str] = []
@@ -4386,6 +4587,72 @@ class MemoryManager:
             threshold=threshold,
         )
 
+    @staticmethod
+    def _temporal_slm_enabled() -> bool:
+        return str(os.getenv("HIPPOCAMPUS_TEMPORAL_SLM_ENABLED", "0")).strip().lower() in {
+            "1", "true", "yes", "on", "enabled"
+        }
+
+    def _validate_temporal_candidate(
+        self,
+        *,
+        content: str,
+        request_content: str | None,
+        as_of: str | None,
+        timezone_name_value: str,
+    ) -> dict[str, Any]:
+        result = self.temporal_gate.validate_candidate(
+            content=content,
+            request_content=request_content,
+            as_of=as_of,
+            timezone_name=timezone_name_value,
+        )
+        unresolved = [
+            claim
+            for claim in result.get("claims") or []
+            if claim.get("status") == "contradicted"
+            and claim.get("reason") == "response_does_not_resolve_request_temporal_conflict"
+        ]
+        other_contradictions = [
+            claim
+            for claim in result.get("claims") or []
+            if claim.get("status") == "contradicted" and claim not in unresolved
+        ]
+        if (
+            not self._temporal_slm_enabled()
+            or not unresolved
+            or other_contradictions
+        ):
+            return result
+        try:
+            extraction = self.extract_structured_temporal_signals(
+                request_content=request_content,
+                response_content=content,
+            )
+            result = self.temporal_gate.validate_candidate(
+                content=content,
+                request_content=request_content,
+                as_of=as_of,
+                timezone_name=timezone_name_value,
+                resolution_signals=extraction.get("signals") or [],
+            )
+            result["request_resolution"]["slm_attempted"] = True
+            result["request_resolution"]["slm"] = {
+                key: extraction.get(key)
+                for key in (
+                    "format",
+                    "provider",
+                    "model",
+                    "duration_ms",
+                    "cached",
+                )
+            }
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            result["request_resolution"]["slm_attempted"] = True
+            result["request_resolution"]["slm_error_type"] = type(exc).__name__
+            result["request_resolution"]["slm_error"] = str(exc)[:500]
+        return result
+
     def select_response_candidate(
         self,
         *,
@@ -4421,11 +4688,11 @@ class MemoryManager:
                 (time.monotonic() - gate_started) * 1000.0,
             )
             temporal_started = time.monotonic()
-            temporal = self.temporal_gate.validate_candidate(
+            temporal = self._validate_temporal_candidate(
                 content=content,
                 request_content=request_content,
                 as_of=as_of,
-                timezone_name=zone,
+                timezone_name_value=zone,
             ) if validate_temporal else {
                 "decision": "allow",
                 "applicable": False,
@@ -4483,8 +4750,17 @@ class MemoryManager:
                                 "reason": claim["reason"],
                                 "expression": claim.get("expression"),
                                 "resolved_date": claim.get("resolved_date"),
+                                "expected_date": claim.get("expected_date"),
                             }
                         )
+        safe_temporal_clarification = next(
+            (
+                item["temporal_validation"].get("safe_request_clarification")
+                for item in evaluated
+                if item["temporal_validation"].get("safe_request_clarification")
+            ),
+            None,
+        )
         return {
             "format": "hippocampus.response-gates.v1",
             "decision": "selected" if selected else "regenerate",
@@ -4492,6 +4768,9 @@ class MemoryManager:
             "selected_content": selected["validation"]["safe_content"] if selected else None,
             "regeneration_required": selected is None,
             "regeneration_feedback": feedback[:16],
+            "safe_temporal_clarification": (
+                safe_temporal_clarification if selected is None else None
+            ),
             "fallback_content": (
                 "過去の発言者または時間関係を根拠から確認できなかったため、応答を再生成します。"
                 if selected is None else None
@@ -4507,11 +4786,11 @@ class MemoryManager:
         as_of: str | None = None,
         timezone: str | None = None,
     ) -> dict[str, Any]:
-        return self.temporal_gate.validate_candidate(
+        return self._validate_temporal_candidate(
             content=content,
             request_content=request_content,
             as_of=as_of,
-            timezone_name=timezone_name(timezone or self.default_timezone),
+            timezone_name_value=timezone_name(timezone or self.default_timezone),
         )
 
     def _record_gate_metric(

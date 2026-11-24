@@ -1,0 +1,1265 @@
+{
+  "format": "hippocampus.evaluation.fixture.v1",
+  "synthetic": true,
+  "data_origin": "new_fictional_fixture",
+  "as_of": "2026-09-01T12:00:00Z",
+  "template_id": "k5-dictionary-fixed-fields-v1",
+  "system_prompt": "This is a fictional evaluation. Return exactly one bare JSON object, without Markdown fences, explanations, or extra fields. Use seven string fields: answer, actor, condition, scope, usage, state, certainty. If no claim is in the memory context, all fields are exactly unknown. Otherwise answer is the lowercase beacon colour stated in the claim, not a truth assertion. actor is exactly proposition.attribution_actor_id when present, otherwise unknown. condition is exactly unconditional if proposition.conditions is empty, otherwise unknown. scope is exactly the claim quantifier. usage is exactly adopted only for dictionary_claims; for knowledge_caveats use caveat and never assert it as established truth. state is exactly knowledge_state. certainty is exactly the numeric assessment.score converted to a string, or unknown if the score is null; neither a score nor lexical relevance makes a caveat adopted. Do not infer global truth, a general habit, or independent corroboration from an attributed report.",
+  "steps": [
+    {
+      "name": "sync",
+      "method": "POST",
+      "route": "/dialogue/sync",
+      "body": {
+        "conversation_id": "eval:chat",
+        "messages": [
+          {
+            "id": "eval:source",
+            "role": "user",
+            "actor_id": "eval:narrator",
+            "content": "The fictional narrator reported a blue beacon once.",
+            "event_time": "2026-09-01T11:00:00Z"
+          },
+          {
+            "id": "eval:neutral-1",
+            "role": "user",
+            "content": "Fictional neutral separator turn 1.",
+            "event_time": "2026-09-01T11:30:00Z"
+          },
+          {
+            "id": "eval:neutral-2",
+            "role": "user",
+            "content": "Fictional neutral separator turn 2.",
+            "event_time": "2026-09-01T11:30:00Z"
+          },
+          {
+            "id": "eval:neutral-3",
+            "role": "user",
+            "content": "Fictional neutral separator turn 3.",
+            "event_time": "2026-09-01T11:30:00Z"
+          },
+          {
+            "id": "eval:neutral-4",
+            "role": "user",
+            "content": "Fictional neutral separator turn 4.",
+            "event_time": "2026-09-01T11:30:00Z"
+          },
+          {
+            "id": "eval:neutral-5",
+            "role": "user",
+            "content": "Fictional neutral separator turn 5.",
+            "event_time": "2026-09-01T11:30:00Z"
+          },
+          {
+            "id": "eval:question",
+            "role": "user",
+            "content": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+            "event_time": "2026-09-01T12:00:00Z"
+          }
+        ],
+        "active_event_ids": [
+          "eval:source",
+          "eval:neutral-1",
+          "eval:neutral-2",
+          "eval:neutral-3",
+          "eval:neutral-4",
+          "eval:neutral-5",
+          "eval:question"
+        ],
+        "revision_key": "r1",
+        "expected_revision": null,
+        "auto_capture": false
+      }
+    },
+    {
+      "name": "source",
+      "method": "POST",
+      "route": "/knowledge/sources",
+      "body": {
+        "idempotency_key": "eval:source",
+        "reason": "New fictional K5 dictionary fixture",
+        "path_revision": "r1",
+        "scope": {
+          "conversation_id": "eval:chat"
+        },
+        "event_ref": {
+          "id": "eval:source",
+          "version": 1
+        },
+        "parent_source_refs": []
+      }
+    },
+    {
+      "name": "claim",
+      "method": "POST",
+      "route": "/knowledge/claims",
+      "body": {
+        "idempotency_key": "eval:claim",
+        "reason": "New fictional K5 dictionary fixture",
+        "path_revision": "r1",
+        "scope": {
+          "conversation_id": "eval:chat"
+        },
+        "proposition": {
+          "text": "The fictional narrator reported a blue beacon once.",
+          "kind": "attributed_report",
+          "subject": "eval:narrator",
+          "predicate": "reported_beacon_colour",
+          "object": "blue",
+          "polarity": "affirmed",
+          "quantifier": "single",
+          "attribution_actor_id": "eval:narrator",
+          "conditions": [],
+          "valid_from": null,
+          "valid_until": null
+        },
+        "origin_refs": [
+          {
+            "id": {
+              "$ref": "source.records.0.id"
+            },
+            "version": 1
+          }
+        ]
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "dictionary_disabled",
+      "condition": "K5 control: adopted claim exists but dictionary disabled",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "disabled",
+      "steps": [
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "action": "adopt",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 0,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "unknown"
+          ],
+          "actor": [
+            "unknown"
+          ],
+          "condition": [
+            "unknown"
+          ],
+          "scope": [
+            "unknown"
+          ],
+          "usage": [
+            "unknown"
+          ],
+          "state": [
+            "unknown"
+          ],
+          "certainty": [
+            "unknown"
+          ]
+        }
+      },
+      "packet_must_not_contain": [
+        "The fictional narrator reported a blue beacon once.",
+        "eval:source",
+        "eval:narrator"
+      ]
+    },
+    {
+      "id": "dictionary_shadow",
+      "condition": "K5 shadow: selected adopted claim is not injected",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "shadow",
+      "steps": [
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "action": "adopt",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 0,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "unknown"
+          ],
+          "actor": [
+            "unknown"
+          ],
+          "condition": [
+            "unknown"
+          ],
+          "scope": [
+            "unknown"
+          ],
+          "usage": [
+            "unknown"
+          ],
+          "state": [
+            "unknown"
+          ],
+          "certainty": [
+            "unknown"
+          ]
+        }
+      },
+      "packet_must_not_contain": [
+        "The fictional narrator reported a blue beacon once.",
+        "eval:source",
+        "eval:narrator"
+      ]
+    },
+    {
+      "id": "dictionary_provisional",
+      "condition": "K5: a candidate is a caveat, never automatically adopted",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "enabled",
+      "steps": [],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 1,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "blue"
+          ],
+          "actor": [
+            "eval:narrator"
+          ],
+          "condition": [
+            "unconditional"
+          ],
+          "scope": [
+            "single"
+          ],
+          "usage": [
+            "caveat"
+          ],
+          "state": [
+            "provisional"
+          ],
+          "certainty": [
+            "unknown"
+          ]
+        }
+      }
+    },
+    {
+      "id": "dictionary_adopted",
+      "condition": "K5: valid reviewed attributed report within its declared scope",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "enabled",
+      "steps": [
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "action": "adopt",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 1,
+        "knowledge_caveats": 0,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "blue"
+          ],
+          "actor": [
+            "eval:narrator"
+          ],
+          "condition": [
+            "unconditional"
+          ],
+          "scope": [
+            "single"
+          ],
+          "usage": [
+            "adopted"
+          ],
+          "state": [
+            "established"
+          ],
+          "certainty": [
+            "0.7"
+          ]
+        }
+      }
+    },
+    {
+      "id": "dictionary_condition_unknown",
+      "condition": "K5: review confidence is retained but applicability is unresolved",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "enabled",
+      "steps": [
+        {
+          "name": "edit",
+          "method": "PATCH",
+          "route": "/knowledge/claims/{{claim.records.0.id}}",
+          "body": {
+            "idempotency_key": "eval:edit",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "proposition": {
+              "text": "The fictional narrator reported a blue beacon once.",
+              "kind": "attributed_report",
+              "subject": "eval:narrator",
+              "predicate": "reported_beacon_colour",
+              "object": "blue",
+              "polarity": "affirmed",
+              "quantifier": "single",
+              "attribution_actor_id": "eval:narrator",
+              "conditions": [
+                "The fictional beacon is in demonstration mode"
+              ],
+              "valid_from": null,
+              "valid_until": null
+            }
+          }
+        },
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 2,
+            "evidence_set_revision": 2,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 3,
+            "claim_revision": 2,
+            "evidence_set_revision": 3,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 3,
+            "claim_revision": 2,
+            "evidence_set_revision": 3,
+            "action": "adopt",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 1,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "blue"
+          ],
+          "actor": [
+            "eval:narrator"
+          ],
+          "condition": [
+            "unknown"
+          ],
+          "scope": [
+            "single"
+          ],
+          "usage": [
+            "caveat"
+          ],
+          "state": [
+            "established"
+          ],
+          "certainty": [
+            "0.7"
+          ]
+        }
+      }
+    },
+    {
+      "id": "dictionary_withdrawn",
+      "condition": "K5: withdrawal keeps history and removes current adoption",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "enabled",
+      "steps": [
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "action": "adopt",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        },
+        {
+          "name": "withdraw",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:withdraw",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 3,
+            "claim_revision": 1,
+            "evidence_set_revision": 2,
+            "action": "withdraw",
+            "profile": "attributed_report",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional narrator reported a blue beacon once.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          }
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 1,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "blue"
+          ],
+          "actor": [
+            "eval:narrator"
+          ],
+          "condition": [
+            "unconditional"
+          ],
+          "scope": [
+            "single"
+          ],
+          "usage": [
+            "caveat"
+          ],
+          "state": [
+            "withdrawal_candidate"
+          ],
+          "certainty": [
+            "0.7"
+          ]
+        }
+      }
+    },
+    {
+      "id": "dictionary_independence_missing",
+      "condition": "K5: one report cannot pass independent-observations adoption",
+      "question": "For the fictional blue beacon claim, what can be asserted, whose report is it, and what are its status, usage and certainty?",
+      "knowledge_mode": "enabled",
+      "steps": [
+        {
+          "name": "edit",
+          "method": "PATCH",
+          "route": "/knowledge/claims/{{claim.records.0.id}}",
+          "body": {
+            "idempotency_key": "eval:edit",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 1,
+            "claim_revision": 1,
+            "evidence_set_revision": 1,
+            "proposition": {
+              "text": "The fictional beacon is blue.",
+              "kind": "empirical",
+              "subject": "eval:beacon",
+              "predicate": "has_colour",
+              "object": "blue",
+              "polarity": "affirmed",
+              "quantifier": "single",
+              "attribution_actor_id": null,
+              "conditions": [],
+              "valid_from": null,
+              "valid_until": null
+            }
+          }
+        },
+        {
+          "name": "evidence",
+          "method": "PUT",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/evidence",
+          "body": {
+            "idempotency_key": "eval:evidence",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 2,
+            "claim_revision": 2,
+            "evidence_set_revision": 2,
+            "evidence": [
+              {
+                "source_ref": {
+                  "id": {
+                    "$ref": "source.records.0.id"
+                  },
+                  "version": 1
+                },
+                "relation": "supports",
+                "content_check": "matched",
+                "source_kind": "primary_report",
+                "origin_status": "known",
+                "span_start": 0,
+                "span_end": 51,
+                "review_reason": "Fixture source explicitly makes this attributed report"
+              }
+            ]
+          }
+        },
+        {
+          "name": "plan",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/search-plans",
+          "body": {
+            "idempotency_key": "eval:plan",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 3,
+            "claim_revision": 2,
+            "evidence_set_revision": 3,
+            "queries": [
+              {
+                "purpose": "falsification",
+                "text": "Find a contradictory beacon colour",
+                "terms": [
+                  "red",
+                  "green"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "alternative_explanation",
+                "text": "Find a calibration fault",
+                "terms": [
+                  "fault",
+                  "calibration"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "boundary_case",
+                "text": "Find conditions outside the observation",
+                "terms": [
+                  "outside",
+                  "except"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              },
+              {
+                "purpose": "source_correction",
+                "text": "Find a correction to the report",
+                "terms": [
+                  "correction",
+                  "withdrawn"
+                ],
+                "reason": "Search the fictional corpus for this possible rebuttal"
+              }
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "method": "POST",
+          "route": "/knowledge/search-plans/{{plan.records.0.id}}/execute",
+          "body": {
+            "idempotency_key": "eval:execute",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1"
+          }
+        },
+        {
+          "name": "adopt",
+          "method": "POST",
+          "route": "/knowledge/claims/{{claim.records.0.id}}/reviews",
+          "body": {
+            "idempotency_key": "eval:adopt",
+            "reason": "New fictional K5 dictionary fixture",
+            "path_revision": "r1",
+            "expected_version": 3,
+            "claim_revision": 2,
+            "evidence_set_revision": 3,
+            "action": "adopt",
+            "profile": "independent_observations",
+            "assessment": {
+              "target": "world_claim",
+              "claim": "The fictional beacon is blue.",
+              "score": 0.7,
+              "status": "assessed",
+              "evidence_refs": [
+                {
+                  "$ref": "evidence.records.1.id"
+                }
+              ]
+            },
+            "search_refs": [
+              {
+                "id": {
+                  "$ref": "search.records.1.id"
+                },
+                "version": 1
+              }
+            ],
+            "counterevidence_status": "none_found_in_scope",
+            "source_independence": "unknown",
+            "review_after": "2026-09-02T12:00:00Z"
+          },
+          "expected_status": 422
+        }
+      ],
+      "packet_expectations": {
+        "dictionary_claims": 0,
+        "knowledge_caveats": 1,
+        "source_evidence": 6
+      },
+      "rubric": {
+        "expected": {
+          "answer": [
+            "blue"
+          ],
+          "actor": [
+            "unknown"
+          ],
+          "condition": [
+            "unconditional"
+          ],
+          "scope": [
+            "single"
+          ],
+          "usage": [
+            "caveat"
+          ],
+          "state": [
+            "provisional"
+          ],
+          "certainty": [
+            "unknown"
+          ]
+        }
+      }
+    }
+  ],
+  "fixture_version": 2
+}

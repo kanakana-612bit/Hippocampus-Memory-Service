@@ -1,0 +1,11 @@
+{
+  "data_notice": "Fictional fixture; no real conversations or previous database content.",
+  "session_start_datetime": "2026-09-24T10:00:00+09:00",
+  "total_session_time_minutes": 30,
+  "messages": [
+    {"role": "user", "text": "架空の庭で、青い花の観察計画を考えたい。"},
+    {"role": "agent", "text": "架空の観察項目として、色と開花時期を分けて記録しましょう。"},
+    {"role": "user", "text": "まず色を記録すると決めた。開花時期の記録方法は未解決だ。"},
+    {"role": "agent", "text": "色の記録は決定事項、開花時期の記録方法は未解決事項として整理します。"}
+  ]
+}

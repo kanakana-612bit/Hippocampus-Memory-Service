@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hippocampus Ver1.0 — 架空データ開発環境</title><link rel="stylesheet" href="/ui/style.css"><script src="/ui/app.js" defer></script></head>
+<body>
+<header><div><p class="eyebrow">HIPPOCAMPUS / VER1.0</p><h1>記憶と文脈のワークスペース</h1><p>架空データ専用・既存の記憶DBから独立した開発環境</p></div><span id="connection" class="badge">未接続</span></header>
+<main>
+<section aria-labelledby="auth-title"><h2 id="auth-title">接続</h2><form id="connect-form"><label>この環境の接続キー<input id="credential" type="password" autocomplete="off" required></label><button>接続する</button><button type="button" id="disconnect">切断・表示を消去</button></form><p class="hint">接続キーはページを開いている間だけ保持します。</p></section>
+<p id="status" role="status" aria-live="polite">接続して開始してください。</p>
+<div id="workspace" hidden>
+<div class="columns">
+<section><h2>1. 架空の原資料を登録</h2><form id="source-form">
+<label>資料ID<input id="source-id" placeholder="fiction-garden" required></label>
+<label>架空のRaw JSON<input id="source-file" type="file" accept=".json,application/json" required></label>
+<div class="row"><label>タイムゾーン<input id="timezone" value="Asia/Tokyo"></label><label>利用を許可する送信先<input id="destinations" value="local" required></label></div>
+<label>アクセス区分<select id="scope"><option value="private">私的利用面のみ（private）</option><option value="personal">本人のみ（personal）</option><option value="public">この所有者内で公開（public）</option><option value="restricted">通常利用を禁止（restricted）</option></select></label>
+<label class="check"><input id="fiction-confirm" type="checkbox" required> このファイルは架空データです</label><button>原資料を登録</button>
+</form><div id="sources" class="cards"></div></section>
+<section><h2>2. 共通の学習経路で解析</h2><form id="run-form">
+<label>登録済み資料<select id="run-source" required></select></label>
+<label>処理<select id="mode"><option value="initial">初期学習</option><option value="daily">日次差分</option><option value="reanalysis">再解析</option></select></label>
+<label>モデル<select id="model"></select></label><p class="hint">実行開始時の設定を固定します。モデルの失敗時に別モデルへ切り替えません。</p>
+<div class="row"><label>開始sequence<input id="first" type="number" min="1" value="1"></label><label>終了sequence<input id="last" type="number" min="1" value="2"></label></div>
+<button>範囲を固定して解析・検証・投入</button></form><p class="hint">日次差分は処理済み位置から確定済み末端までを選びます。要確認の候補は保留します。</p><div id="runs" class="cards"></div></section>
+</div>
+<section><h2>現在の利用場面</h2><form id="situation-form"><label>部屋名<input id="room" value="架空の研究室"></label><label>閲覧者<select id="audience"><option value="owner">本人</option><option value="guest">ゲスト同席</option><option value="public">公開の場</option></select></label><button>1時間の利用場面を設定</button></form><p class="hint">場面の変更時は現在の表示を消去し、現在の権限で読み直します。</p></section>
+<section><h2>選択した資料の直近2ターン</h2><p class="hint">ユーザー発話と、それに続く応答・ツール結果をまとめて表示します。非表示にしても保存内容は変わりません。</p><div id="recent" class="cards"></div></section>
+<section><h2>原文と派生記憶の履歴</h2><form id="history-form"><label>日本語を含む全文検索<input id="query"></label><label>日付<input id="day" type="date"></label><label>時刻の区分<select id="bucket"><option value="">すべて</option><option value="dated">日時あり・推定日時</option><option value="approximate_range">おおよその期間</option><option value="unknown">日付不明</option></select></label><button>検索</button></form><p id="history-count" class="hint"></p><div id="history" class="cards"></div><button id="more" type="button" hidden>次のページ</button><button id="export" type="button">同じ条件の全件を抽出</button></section>
+<section><h2>文脈と所属</h2><div id="contexts" class="cards"></div></section>
+<section><h2>想起と注入の観測</h2><form id="recall-form"><label>探索する内容<input id="recall-query" required></label><button>候補を選択</button></form><div id="recall" class="cards"></div></section>
+</div>
+</main><footer>Ver1.0 開発版 · 実ログの初期学習は未開放 · モデルの提案は真偽未評価の候補です</footer>
+</body></html>

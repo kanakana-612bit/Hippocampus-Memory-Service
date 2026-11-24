@@ -6,7 +6,6 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -27,7 +26,6 @@ class LayeredMemoryApiTests(unittest.TestCase):
         import app as app_module
 
         cls.client = TestClient(app_module.app)
-        cls.manager = app_module.manager
         cls.security_dir = app_module.manager.layered.security.security_dir
 
     @classmethod
@@ -92,92 +90,6 @@ class LayeredMemoryApiTests(unittest.TestCase):
         self.assertTrue(body["complete"])
         self.assertEqual(body["missing_objects"], [])
         self.assertTrue(all(body["capabilities"].values()))
-
-    def test_conversation_segmentation_routes(self) -> None:
-        conversation_id = "api-segmentation-chat"
-        self.manager.ingest_messages(
-            conversation_id,
-            [
-                {
-                    "id": "api-segment-u1",
-                    "role": "user",
-                    "content": "First topic",
-                    "event_time": "2026-08-16T09:00:00+00:00",
-                },
-                {
-                    "id": "api-segment-a1",
-                    "role": "assistant",
-                    "content": "First response",
-                    "event_time": "2026-08-16T09:01:00+00:00",
-                },
-                {
-                    "id": "api-segment-u2",
-                    "role": "user",
-                    "content": "Later topic",
-                    "event_time": "2026-08-16T11:00:00+00:00",
-                },
-            ],
-            auto_capture=False,
-        )
-
-        detected = self.client.post(
-            "/memory/segments/detect",
-            json={
-                "conversation_id": conversation_id,
-                "session_gap_minutes": 90,
-                "use_slm": False,
-                "persist": True,
-            },
-        )
-        self.assertEqual(detected.status_code, 200, detected.text)
-        body = detected.json()
-        self.assertEqual(body["boundary_count"], 1)
-        self.assertEqual(body["segment_count"], 4)
-
-        boundaries = self.client.get(
-            "/memory/boundaries", params={"conversation_id": conversation_id}
-        )
-        self.assertEqual(boundaries.status_code, 200, boundaries.text)
-        self.assertEqual(boundaries.json()[0]["after_event_id"], "api-segment-u2")
-
-        segments = self.client.get(
-            "/memory/segments",
-            params={"conversation_id": conversation_id, "segment_type": "session"},
-        )
-        self.assertEqual(segments.status_code, 200, segments.text)
-        self.assertEqual(len(segments.json()), 2)
-
-        status = self.client.get("/status/segmentation")
-        self.assertEqual(status.status_code, 200, status.text)
-        self.assertTrue(status.json()["complete"])
-        self.assertEqual(status.json()["schema_version"], 8)
-
-    def test_structured_slm_claim_route_accepts_user_or_assistant_input(self) -> None:
-        extracted = {
-            "format": "hippocampus.structured-claims.v1",
-            "source_role": "assistant",
-            "claims": [
-                {
-                    "subject": "user",
-                    "predicate": "said",
-                    "content": "A was discussed",
-                    "evidence_marker": None,
-                }
-            ],
-            "gate_claims": [],
-            "provider": "ollama",
-            "model": "test-model",
-            "duration_ms": 1.0,
-            "cached": False,
-        }
-        with patch.object(self.manager, "extract_structured_claims", return_value=extracted):
-            response = self.client.post(
-                "/slm/claims/extract",
-                json={"source_role": "assistant", "content": "The user discussed A."},
-            )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["claims"][0]["subject"], "user")
 
     def test_phase2_ingest_and_status(self) -> None:
         status = self.client.get("/status/phase2")
@@ -374,38 +286,6 @@ class LayeredMemoryApiTests(unittest.TestCase):
 
         status = self.client.get("/status/attribution-gate")
         self.assertTrue(status.json()["complete"])
-
-    def test_candidate_selection_checks_request_temporal_constraints(self) -> None:
-        response = self.client.post(
-            "/response/candidates/select",
-            json={
-                "request_content": (
-                    "明日の予定だけどさ、8/13に買い物に行くから、"
-                    "朝9時になったら教えて"
-                ),
-                "as_of": "2026-08-16T11:41:00+09:00",
-                "timezone": "Asia/Tokyo",
-                "candidates": [
-                    {
-                        "candidate_id": "primary",
-                        "content": (
-                            "2026年8月13日に買い物に行かれるのですね。"
-                            "午前9時になりましたらお知らせします。"
-                        ),
-                    }
-                ],
-            },
-        )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["decision"], "regenerate")
-        self.assertTrue(
-            any(
-                item["reason"]
-                == "response_does_not_resolve_request_temporal_conflict"
-                for item in response.json()["regeneration_feedback"]
-            )
-        )
 
     def test_invalid_phase3_timestamp_returns_400(self) -> None:
         response = self.client.post(
