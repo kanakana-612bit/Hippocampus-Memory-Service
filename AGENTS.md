@@ -39,5 +39,23 @@ small, label them as demo data, and review them manually before publication.
 5. Inspect staged content for names, chat IDs, local paths, credentials, and raw
    conversation text before the final commit.
 
+## Publication identity and hooks
+
+- Before creating commits in a new clone, install the guards with
+  `python scripts/install_publication_hooks.py --name YOUR_HANDLE --email YOUR_NOREPLY`.
+  Both author and committer must use GitHub noreply identities.
+- Do not bypass pre-commit, commit-msg or pre-push. They check the actual index,
+  commit/tag metadata and every reachable commit/tree, including deleted content.
+- Do not use API/connector commit or file-write operations that cannot explicitly
+  set both author and committer identities. Local Git settings do not configure APIs.
+- Before publication run `python scripts/check_commit_privacy.py check HEAD`.
+  Afterwards verify the remote ref, tree, author/committer and Publication guard result.
+- Fail closed on missing history, unreadable objects, binaries and LFS payloads.
+  There is no blanket exemption for large files, documentation assets or guard scripts.
+- Use only fictional test data. Passing static checks is not proof that text is
+  fictional; review provenance manually without opening private runtime data.
+- GitHub Actions is a post-upload detection layer. Hooks must be installed in every
+  clone; other clients and API writes do not inherit them. See `docs/privacy.md`.
+
 If branch state or publication scope is unclear, do not push until it has been
 resolved explicitly.

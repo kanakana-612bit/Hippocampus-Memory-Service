@@ -44,8 +44,7 @@ tmp/
 *.p12
 *.pfx
 
-# Generated media is excluded by default. Curated public documentation assets
-# must be reviewed and placed under docs/assets/.
+# Media must be reviewed separately; no documentation-directory exemption.
 *.png
 *.jpg
 *.jpeg
@@ -57,8 +56,16 @@ tmp/
 *.ogg
 *.mp4
 *.webm
-!docs/assets/
-!docs/assets/**
+*.aac
+*.aif
+*.aiff
+*.amr
+*.m4a
+*.opus
+*.wma
+*.mkv
+*.mov
+*.avi
 
 .pytest_cache/
 .ruff_cache/
